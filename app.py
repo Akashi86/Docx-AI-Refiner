@@ -47,6 +47,10 @@ TITLE_LIKE_RE = re.compile(
     r"^(abstract|chapter|section|table of contents|contents|references|bibliography|appendix)\b",
     re.IGNORECASE,
 )
+PROMPT_TEMPLATES = {
+    "降 AI 率（英文）": """Without changing the paragraph structure or the order of information, rewrite the text below to reduce Al vibes. Do not start sentences with generic stock phrases ("in conclusion," "moreover," etc.); use more specific, context-tied transitions instead. Make each paragraph's first sentence feel like a natural continuation of the previous one. Favor concrete verbs over stacks of abstract nouns, keep terminology precise, and split long sentences into 2- 3 shorter ones.""",
+    "降 AI 率（中文）": """请在不改变段落结构与信息顺序的前提下，重写下面文本以降低 AI 痕迹：同一句不要用常见的套话开头（如“综上所述”“此外”），改用更具体的衔接方式；让每段首句更像“承接上文”的自然过渡。多用具体动词，少用抽象名词堆叠。保持术语准确，但把长句拆成 2-3 个短句。""",
+}
 
 
 st.set_page_config(page_title="AI Word 论文润色工具", layout="wide")
@@ -533,8 +537,8 @@ with col_left:
     min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=20, step=5)
 
     st.subheader("2. 润色提示词")
-    default_prompt = """Without changing the paragraph structure or the order of information, rewrite the text below to reduce Al vibes. Do not start sentences with generic stock phrases ("in conclusion," "moreover," etc.); use more specific, context-tied transitions instead. Make each paragraph's first sentence feel like a natural continuation of the previous one. Favor concrete verbs over stacks of abstract nouns, keep terminology precise, and split long sentences into 2- 3 shorter ones."""
-    prompt = st.text_area("提示词", value=default_prompt, height=180)
+    prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
+    prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
 
     st.subheader("3. 上传文档")
     uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
