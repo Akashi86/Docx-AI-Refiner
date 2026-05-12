@@ -33,6 +33,20 @@ for prefix, uri in NAMESPACES.items():
 W_NS = f"{{{NAMESPACES['w']}}}"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 SEGMENT_RE = re.compile(r"<seg\s+id=\"(\d+)\">(.*?)</seg>", re.DOTALL)
+SKIP_STYLE_KEYWORDS = (
+    "title",
+    "heading",
+    "toc",
+    "caption",
+    "header",
+    "footer",
+    "bibliography",
+    "reference",
+)
+TITLE_LIKE_RE = re.compile(
+    r"^(abstract|chapter|section|table of contents|contents|references|bibliography|appendix)\b",
+    re.IGNORECASE,
+)
 
 
 st.set_page_config(page_title="AI Word 论文润色工具", layout="wide")
@@ -58,11 +72,13 @@ st.markdown(
     .log-err { color: #f87171; font-weight: bold; }
     .log-info { color: #c084fc; font-weight: bold; }
     .diff-box {
-        border: 1px solid #e5e7eb;
+        border: 1px solid #374151;
         border-radius: 8px;
         padding: 12px;
-        background: #fafafa;
+        background: #111827;
+        color: #e5e7eb;
         line-height: 1.7;
+        min-height: 44px;
     }
     .diff-del {
         color: #b91c1c;
@@ -262,6 +278,16 @@ def paragraph_plain_text(paragraph):
     return "".join(elem.text or "" for elem in paragraph.iter(f"{W_NS}t")).strip()
 
 
+def paragraph_style_id(paragraph):
+    p_pr = paragraph.find(f"{W_NS}pPr")
+    if p_pr is None:
+        return ""
+    p_style = p_pr.find(f"{W_NS}pStyle")
+    if p_style is None:
+        return ""
+    return p_style.get(f"{W_NS}val", "")
+
+
 def paragraph_page_number(paragraph, current_page):
     page_breaks = len(paragraph.findall(f".//{W_NS}lastRenderedPageBreak"))
     for br in paragraph.findall(f".//{W_NS}br"):
@@ -273,6 +299,14 @@ def paragraph_page_number(paragraph, current_page):
 def is_body_paragraph(paragraph):
     text = paragraph_plain_text(paragraph)
     if not text:
+        return False
+    style_id = paragraph_style_id(paragraph).lower()
+    if any(keyword in style_id for keyword in SKIP_STYLE_KEYWORDS):
+        return False
+    compact_text = re.sub(r"\s+", " ", text).strip()
+    if TITLE_LIKE_RE.match(compact_text) and len(compact_text) <= 80:
+        return False
+    if len(compact_text.split()) <= 4 and not compact_text.endswith((".", "?", "!", "。", "？", "！")):
         return False
     return True
 
@@ -376,6 +410,8 @@ def process_word(
                         values = parse_segment_response(response_text, task["segment_count"])
                         original_text = task["plain_text"]
                         new_text = "".join(values).strip()
+                        diff_html = make_diff_html(original_text, new_text)
+                        status = "changed" if original_text != new_text else "unchanged"
                         apply_segment_values(task, values)
                         st.session_state.rewrite_report.append(
                             {
@@ -383,12 +419,15 @@ def process_word(
                                 "page": task["page"],
                                 "original_text": original_text,
                                 "new_text": new_text,
-                                "diff_html": make_diff_html(original_text, new_text),
-                                "status": "success",
+                                "diff_html": diff_html,
+                                "status": status,
                                 "error": "",
                             }
                         )
-                        add_log(f"第 {para_no} 段处理完成，并已写回原文本节点。", "success")
+                        if status == "changed":
+                            add_log(f"第 {para_no} 段处理完成，并已写回原文本节点。", "success")
+                        else:
+                            add_log(f"第 {para_no} 段处理完成，但文本无明显变化。", "info")
                     except Exception as exc:
                         st.session_state.rewrite_report.append(
                             {
@@ -507,12 +546,14 @@ if st.session_state.rewrite_report:
     st.divider()
     st.subheader("改写对照清单")
 
-    successful_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "success")
-    failed_count = len(st.session_state.rewrite_report) - successful_count
-    metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+    changed_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "changed")
+    unchanged_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "unchanged")
+    failed_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "failed")
+    metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
     metric_col_1.metric("处理段落", len(st.session_state.rewrite_report))
-    metric_col_2.metric("成功替换", successful_count)
-    metric_col_3.metric("保留原文", failed_count)
+    metric_col_2.metric("成功替换", changed_count)
+    metric_col_3.metric("无变化", unchanged_count)
+    metric_col_4.metric("保留原文", failed_count)
 
     download_col_1, download_col_2 = st.columns(2)
     download_col_1.download_button(
@@ -535,7 +576,12 @@ if st.session_state.rewrite_report:
         key=lambda item: (item["page"], item["paragraph_index"]),
     )
     for item in sorted_report:
-        status_text = "已替换" if item["status"] == "success" else "保留原文"
+        status_text_map = {
+            "changed": "已替换",
+            "unchanged": "无变化",
+            "failed": "保留原文",
+        }
+        status_text = status_text_map.get(item["status"], item["status"])
         with st.expander(f"第 {item['page']} 页 / 第 {item['paragraph_index']} 段 - {status_text}"):
             before_col, after_col = st.columns(2)
             before_col.markdown("**原文**")
@@ -543,11 +589,13 @@ if st.session_state.rewrite_report:
             after_col.markdown("**改写后**")
             after_col.write(item["new_text"])
 
-            if item["status"] == "success":
+            if item["status"] == "changed":
                 st.markdown("**差异高亮**")
                 st.markdown(
                     f'<div class="diff-box">{item["diff_html"]}</div>',
                     unsafe_allow_html=True,
                 )
+            elif item["status"] == "unchanged":
+                st.info("这一段 AI 返回内容与原文一致，没有产生可展示的文本差异。")
             else:
                 st.warning(f"这一段没有写回，原因：{item['error']}")
