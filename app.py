@@ -80,19 +80,34 @@ st.markdown(
         line-height: 1.7;
         min-height: 44px;
     }
-    .diff-del {
-        color: #b91c1c;
-        background: #fee2e2;
-        text-decoration: line-through;
-        padding: 1px 3px;
-        border-radius: 4px;
-    }
     .diff-ins {
         color: #166534;
         background: #dcfce7;
         text-decoration: none;
         padding: 1px 3px;
         border-radius: 4px;
+    }
+    .diff-replace {
+        color: #92400e;
+        background: #fef3c7;
+        padding: 1px 3px;
+        border-radius: 4px;
+    }
+    .compare-row {
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 14px;
+        margin-bottom: 14px;
+        background: #111827;
+    }
+    .compare-meta {
+        font-weight: 700;
+        margin-bottom: 12px;
+    }
+    .compare-text {
+        line-height: 1.7;
+        white-space: pre-wrap;
+        word-break: break-word;
     }
     </style>
     """,
@@ -174,12 +189,14 @@ def make_diff_html(old_text, new_text):
         if tag == "equal":
             parts.append(html.escape(new_part))
         elif tag == "delete":
-            parts.append(f'<del class="diff-del">{html.escape(old_part)}</del>')
+            continue
         elif tag == "insert":
             parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
         elif tag == "replace":
-            parts.append(f'<del class="diff-del">{html.escape(old_part)}</del>')
-            parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
+            parts.append(
+                f'<span class="diff-replace" title="原文：{html.escape(old_part, quote=True)}">'
+                f"{html.escape(new_part)}</span>"
+            )
 
     return " ".join(part for part in parts if part)
 
@@ -582,20 +599,29 @@ if st.session_state.rewrite_report:
             "failed": "保留原文",
         }
         status_text = status_text_map.get(item["status"], item["status"])
-        with st.expander(f"第 {item['page']} 页 / 第 {item['paragraph_index']} 段 - {status_text}"):
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="compare-meta">第 {item["page"]} 页 / 第 {item["paragraph_index"]} 段 - {status_text}</div>',
+                unsafe_allow_html=True,
+            )
             before_col, after_col = st.columns(2)
             before_col.markdown("**原文**")
-            before_col.write(item["original_text"])
+            before_col.markdown(
+                f'<div class="compare-text">{html.escape(item["original_text"])}</div>',
+                unsafe_allow_html=True,
+            )
             after_col.markdown("**改写后**")
-            after_col.write(item["new_text"])
-
             if item["status"] == "changed":
-                st.markdown("**差异高亮**")
-                st.markdown(
-                    f'<div class="diff-box">{item["diff_html"]}</div>',
+                after_col.markdown(
+                    f'<div class="compare-text">{item["diff_html"]}</div>',
                     unsafe_allow_html=True,
                 )
-            elif item["status"] == "unchanged":
-                st.info("这一段 AI 返回内容与原文一致，没有产生可展示的文本差异。")
             else:
-                st.warning(f"这一段没有写回，原因：{item['error']}")
+                after_col.markdown(
+                    f'<div class="compare-text">{html.escape(item["new_text"])}</div>',
+                    unsafe_allow_html=True,
+                )
+                if item["status"] == "unchanged":
+                    after_col.info("无明显文本差异。")
+                else:
+                    after_col.warning(f"未写回：{item['error']}")
