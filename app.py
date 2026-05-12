@@ -80,6 +80,13 @@ st.markdown(
         line-height: 1.7;
         min-height: 44px;
     }
+    .diff-del {
+        color: #991b1b;
+        background: #fee2e2;
+        text-decoration: line-through;
+        padding: 1px 3px;
+        border-radius: 4px;
+    }
     .diff-ins {
         color: #166534;
         background: #dcfce7;
@@ -87,7 +94,13 @@ st.markdown(
         padding: 1px 3px;
         border-radius: 4px;
     }
-    .diff-replace {
+    .diff-replace-old {
+        color: #7f1d1d;
+        background: #fecaca;
+        padding: 1px 3px;
+        border-radius: 4px;
+    }
+    .diff-replace-new {
         color: #92400e;
         background: #fef3c7;
         padding: 1px 3px;
@@ -176,29 +189,38 @@ def parse_segment_response(response_text, expected_count):
     return values
 
 
-def make_diff_html(old_text, new_text):
+def make_diff_html_pair(old_text, new_text):
     old_words = old_text.split()
     new_words = new_text.split()
     matcher = difflib.SequenceMatcher(None, old_words, new_words)
-    parts = []
+    old_parts = []
+    new_parts = []
 
     for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
         old_part = " ".join(old_words[old_start:old_end])
         new_part = " ".join(new_words[new_start:new_end])
 
         if tag == "equal":
-            parts.append(html.escape(new_part))
+            old_parts.append(html.escape(old_part))
+            new_parts.append(html.escape(new_part))
         elif tag == "delete":
-            continue
+            old_parts.append(f'<del class="diff-del">{html.escape(old_part)}</del>')
         elif tag == "insert":
-            parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
+            new_parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
         elif tag == "replace":
-            parts.append(
-                f'<span class="diff-replace" title="原文：{html.escape(old_part, quote=True)}">'
+            old_parts.append(
+                f'<span class="diff-replace-old" title="改写后：{html.escape(new_part, quote=True)}">'
+                f"{html.escape(old_part)}</span>"
+            )
+            new_parts.append(
+                f'<span class="diff-replace-new" title="原文：{html.escape(old_part, quote=True)}">'
                 f"{html.escape(new_part)}</span>"
             )
 
-    return " ".join(part for part in parts if part)
+    return {
+        "old_html": " ".join(part for part in old_parts if part),
+        "new_html": " ".join(part for part in new_parts if part),
+    }
 
 
 def report_to_json(report):
@@ -427,7 +449,7 @@ def process_word(
                         values = parse_segment_response(response_text, task["segment_count"])
                         original_text = task["plain_text"]
                         new_text = "".join(values).strip()
-                        diff_html = make_diff_html(original_text, new_text)
+                        diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         apply_segment_values(task, values)
                         st.session_state.rewrite_report.append(
@@ -436,7 +458,8 @@ def process_word(
                                 "page": task["page"],
                                 "original_text": original_text,
                                 "new_text": new_text,
-                                "diff_html": diff_html,
+                                "old_diff_html": diff_html["old_html"],
+                                "new_diff_html": diff_html["new_html"],
                                 "status": status,
                                 "error": "",
                             }
@@ -452,7 +475,8 @@ def process_word(
                                 "page": task["page"],
                                 "original_text": task["plain_text"],
                                 "new_text": task["plain_text"],
-                                "diff_html": "",
+                                "old_diff_html": "",
+                                "new_diff_html": "",
                                 "status": "failed",
                                 "error": str(exc),
                             }
@@ -606,14 +630,20 @@ if st.session_state.rewrite_report:
             )
             before_col, after_col = st.columns(2)
             before_col.markdown("**原文**")
-            before_col.markdown(
-                f'<div class="compare-text">{html.escape(item["original_text"])}</div>',
-                unsafe_allow_html=True,
-            )
+            if item["status"] == "changed":
+                before_col.markdown(
+                    f'<div class="compare-text">{item["old_diff_html"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                before_col.markdown(
+                    f'<div class="compare-text">{html.escape(item["original_text"])}</div>',
+                    unsafe_allow_html=True,
+                )
             after_col.markdown("**改写后**")
             if item["status"] == "changed":
                 after_col.markdown(
-                    f'<div class="compare-text">{item["diff_html"]}</div>',
+                    f'<div class="compare-text">{item["new_diff_html"]}</div>',
                     unsafe_allow_html=True,
                 )
             else:
