@@ -1,6 +1,9 @@
 import concurrent.futures
+import csv
+import difflib
 import html
 import io
+import json
 import re
 import time
 import zipfile
@@ -54,6 +57,27 @@ st.markdown(
     .log-warn { color: #fbbf24; }
     .log-err { color: #f87171; font-weight: bold; }
     .log-info { color: #c084fc; font-weight: bold; }
+    .diff-box {
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 12px;
+        background: #fafafa;
+        line-height: 1.7;
+    }
+    .diff-del {
+        color: #b91c1c;
+        background: #fee2e2;
+        text-decoration: line-through;
+        padding: 1px 3px;
+        border-radius: 4px;
+    }
+    .diff-ins {
+        color: #166534;
+        background: #dcfce7;
+        text-decoration: none;
+        padding: 1px 3px;
+        border-radius: 4px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -63,6 +87,8 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 if "processed_file" not in st.session_state:
     st.session_state.processed_file = None
+if "rewrite_report" not in st.session_state:
+    st.session_state.rewrite_report = []
 
 
 def add_log(message, kind="normal"):
@@ -117,6 +143,54 @@ def parse_segment_response(response_text, expected_count):
     if missing:
         raise ValueError(f"AI 缺少片段 id: {missing}")
     return values
+
+
+def make_diff_html(old_text, new_text):
+    old_words = old_text.split()
+    new_words = new_text.split()
+    matcher = difflib.SequenceMatcher(None, old_words, new_words)
+    parts = []
+
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        old_part = " ".join(old_words[old_start:old_end])
+        new_part = " ".join(new_words[new_start:new_end])
+
+        if tag == "equal":
+            parts.append(html.escape(new_part))
+        elif tag == "delete":
+            parts.append(f'<del class="diff-del">{html.escape(old_part)}</del>')
+        elif tag == "insert":
+            parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
+        elif tag == "replace":
+            parts.append(f'<del class="diff-del">{html.escape(old_part)}</del>')
+            parts.append(f'<ins class="diff-ins">{html.escape(new_part)}</ins>')
+
+    return " ".join(part for part in parts if part)
+
+
+def report_to_json(report):
+    return json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def report_to_csv(report):
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["paragraph_index", "page", "original_text", "new_text", "status", "error"],
+    )
+    writer.writeheader()
+    for item in report:
+        writer.writerow(
+            {
+                "paragraph_index": item.get("paragraph_index", ""),
+                "page": item.get("page", ""),
+                "original_text": item.get("original_text", ""),
+                "new_text": item.get("new_text", ""),
+                "status": item.get("status", ""),
+                "error": item.get("error", ""),
+            }
+        )
+    return output.getvalue().encode("utf-8-sig")
 
 
 def make_system_prompt(user_prompt):
@@ -254,6 +328,7 @@ def process_word(
     progress_bar,
 ):
     st.session_state.logs = []
+    st.session_state.rewrite_report = []
 
     try:
         add_log("正在读取并解析 Word 文档。")
@@ -299,9 +374,33 @@ def process_word(
                     try:
                         response_text = future.result()
                         values = parse_segment_response(response_text, task["segment_count"])
+                        original_text = task["plain_text"]
+                        new_text = "".join(values).strip()
                         apply_segment_values(task, values)
+                        st.session_state.rewrite_report.append(
+                            {
+                                "paragraph_index": para_no,
+                                "page": task["page"],
+                                "original_text": original_text,
+                                "new_text": new_text,
+                                "diff_html": make_diff_html(original_text, new_text),
+                                "status": "success",
+                                "error": "",
+                            }
+                        )
                         add_log(f"第 {para_no} 段处理完成，并已写回原文本节点。", "success")
                     except Exception as exc:
+                        st.session_state.rewrite_report.append(
+                            {
+                                "paragraph_index": para_no,
+                                "page": task["page"],
+                                "original_text": task["plain_text"],
+                                "new_text": task["plain_text"],
+                                "diff_html": "",
+                                "status": "failed",
+                                "error": str(exc),
+                            }
+                        )
                         add_log(f"第 {para_no} 段处理失败，已保留原文：{exc}", "err")
 
                     completed_tasks += 1
@@ -403,3 +502,52 @@ with col_right:
             use_container_width=True,
             type="primary",
         )
+
+if st.session_state.rewrite_report:
+    st.divider()
+    st.subheader("改写对照清单")
+
+    successful_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "success")
+    failed_count = len(st.session_state.rewrite_report) - successful_count
+    metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+    metric_col_1.metric("处理段落", len(st.session_state.rewrite_report))
+    metric_col_2.metric("成功替换", successful_count)
+    metric_col_3.metric("保留原文", failed_count)
+
+    download_col_1, download_col_2 = st.columns(2)
+    download_col_1.download_button(
+        "下载对照清单 JSON",
+        data=report_to_json(st.session_state.rewrite_report),
+        file_name="rewrite_report.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    download_col_2.download_button(
+        "下载对照清单 CSV",
+        data=report_to_csv(st.session_state.rewrite_report),
+        file_name="rewrite_report.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    sorted_report = sorted(
+        st.session_state.rewrite_report,
+        key=lambda item: (item["page"], item["paragraph_index"]),
+    )
+    for item in sorted_report:
+        status_text = "已替换" if item["status"] == "success" else "保留原文"
+        with st.expander(f"第 {item['page']} 页 / 第 {item['paragraph_index']} 段 - {status_text}"):
+            before_col, after_col = st.columns(2)
+            before_col.markdown("**原文**")
+            before_col.write(item["original_text"])
+            after_col.markdown("**改写后**")
+            after_col.write(item["new_text"])
+
+            if item["status"] == "success":
+                st.markdown("**差异高亮**")
+                st.markdown(
+                    f'<div class="diff-box">{item["diff_html"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning(f"这一段没有写回，原因：{item['error']}")
