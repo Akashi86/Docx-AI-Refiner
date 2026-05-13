@@ -1591,6 +1591,7 @@ def process_word_baidu(
     file_bytes,
     baidu_appid,
     baidu_secret_key,
+    lang_chain,
     start_paragraph_index,
     end_paragraph_index,
     min_chars,
@@ -1630,8 +1631,10 @@ def process_word_baidu(
                 update_progress(0, "没有找到可处理段落。")
                 return None
 
-            add_log(f"共找到 {len(tasks)} 个待处理段落，开始逐段回译（英→中→英）。", "info")
-            add_log("注意：百度翻译免费版 QPS=1，每段约需 2~3 秒，请耐心等待。", "warn")
+            chain_label = " → ".join(lang_chain)
+            steps = len(lang_chain) - 1
+            add_log(f"共找到 {len(tasks)} 个待处理段落，翻译链条：{chain_label}（共 {steps} 步）。", "info")
+            add_log(f"注意：百度翻译免费版 QPS=1，每段约需 {steps * 1.1:.0f}~{steps * 2:.0f} 秒，请耐心等待。", "warn")
             update_progress(0.06, f"已找到 {len(tasks)} 个待处理段落，开始回译...")
             render_logs(log_container)
 
@@ -1640,19 +1643,17 @@ def process_word_baidu(
                 original_text = task["plain_text"]
                 reject_reason = ""
                 try:
-                    add_log(f"第 {para_no} 段，第 {task['page']} 页：英→中...", "send")
-                    render_logs(log_container)
-                    chinese_text = call_baidu_translate(
-                        original_text, "en", "zh", baidu_appid, baidu_secret_key
-                    )
-                    time.sleep(1.1)
-                    add_log(f"第 {para_no} 段：中→英...", "send")
-                    render_logs(log_container)
-                    english_text = call_baidu_translate(
-                        chinese_text, "zh", "en", baidu_appid, baidu_secret_key
-                    )
-                    time.sleep(1.1)
-                    new_text = english_text.strip()
+                    current_text = original_text
+                    for step_i in range(len(lang_chain) - 1):
+                        from_lang = lang_chain[step_i]
+                        to_lang = lang_chain[step_i + 1]
+                        add_log(f"第 {para_no} 段 步骤{step_i + 1}/{len(lang_chain) - 1}：{from_lang}→{to_lang}...", "send")
+                        render_logs(log_container)
+                        current_text = call_baidu_translate(
+                            current_text, from_lang, to_lang, baidu_appid, baidu_secret_key
+                        )
+                        time.sleep(1.1)
+                    new_text = current_text.strip()
                     diff_html = make_diff_html_pair(original_text, new_text)
                     status = "changed" if original_text != new_text else "unchanged"
                     reject_reason = suspicious_rewrite_reason(
@@ -1674,7 +1675,7 @@ def process_word_baidu(
                         "section": task["section_heading"],
                         "section_type": task["section_type"],
                         "write_mode": task.get("write_mode", ""),
-                        "rewrite_rounds": 2,
+                        "rewrite_rounds": len(lang_chain) - 1,
                         "second_rewrite_applied": False,
                         "reject_reason": "",
                         "risk_tags": ", ".join(task["risk_profile"]["tags"]),
@@ -2099,11 +2100,61 @@ with col_left:
         prompt = ""
         rewrite_temperature = 0.55
         adaptive_risk_repair = False
-        st.subheader("5. 回译说明")
+        st.subheader("5. 多语言回译链条")
+        BAIDU_LANG_OPTIONS = {
+            "英语 (en)": "en",
+            "中文 (zh)": "zh",
+            "法语 (fra)": "fra",
+            "俄语 (ru)": "ru",
+            "日语 (jp)": "jp",
+            "德语 (de)": "de",
+            "西班牙语 (spa)": "spa",
+            "阿拉伯语 (ara)": "ara",
+            "韩语 (kor)": "kor",
+            "葡萄牙语 (pt)": "pt",
+        }
+        PRESET_CHAINS = {
+            "英→中→英（2步，最快）": ["en", "zh", "en"],
+            "英→法→中→英（3步）": ["en", "fra", "zh", "en"],
+            "英→法→中→俄→英（4步）": ["en", "fra", "zh", "ru", "en"],
+            "英→日→法→中→英（4步）": ["en", "jp", "fra", "zh", "en"],
+            "英→德→日→中→俄→英（5步）": ["en", "de", "jp", "zh", "ru", "en"],
+            "自定义": None,
+        }
+        preset_name = st.selectbox(
+            "预设链条",
+            list(PRESET_CHAINS.keys()),
+            index=1,
+            help="选择预设翻译链条，步数越多混淆效果越强，但耗时更长。",
+        )
+        if PRESET_CHAINS[preset_name] is not None:
+            lang_chain = PRESET_CHAINS[preset_name]
+            chain_display = " → ".join(
+                next(k for k, v in BAIDU_LANG_OPTIONS.items() if v == c)
+                for c in lang_chain
+            )
+            st.caption(f"当前链条：{chain_display}")
+        else:
+            st.caption("自定义中间语言（起点英语 en，终点英语 en 固定，选择中间经过的语言）")
+            mid_langs = st.multiselect(
+                "中间语言（按顺序选择）",
+                [k for k in BAIDU_LANG_OPTIONS if k != "英语 (en)"],
+                default=["法语 (fra)", "中文 (zh)"],
+                key="custom_mid_langs",
+            )
+            if not mid_langs:
+                st.warning("请至少选择一种中间语言。")
+                mid_langs = ["中文 (zh)"]
+            lang_chain = ["en"] + [BAIDU_LANG_OPTIONS[k] for k in mid_langs] + ["en"]
+            chain_display = " → ".join(
+                next(k for k, v in BAIDU_LANG_OPTIONS.items() if v == c)
+                for c in lang_chain
+            )
+            st.caption(f"当前链条：{chain_display}")
+        steps = len(lang_chain) - 1
         st.info(
-            "回译模式不需要提示词和改写强度。\n\n"
-            "流程：英文段落 → 百度翻译成中文 → 再翻译回英文。\n"
-            "所有已有安全阀（长度控制、格式保护、protected text 检测等）均正常生效。"
+            f"翻译步数：{steps} 步，每段约需 {steps * 1.1:.0f}~{steps * 2:.0f} 秒（免费版 QPS=1）。\n"
+            "所有格式安全阀、长度保护、protected text 检测均正常生效。"
         )
 
     enforce_format_safety = st.checkbox(
@@ -2169,6 +2220,7 @@ with col_right:
                     uploaded_file.getvalue(),
                     baidu_appid,
                     baidu_secret_key,
+                    lang_chain,
                     start_paragraph_index,
                     end_paragraph_index,
                     min_chars,
