@@ -498,6 +498,17 @@ def clean_html_fragment(raw_html):
     return normalize_visible_text(text)
 
 
+def extract_paperyy_aigc_fragments_from_html(text):
+    fragments = []
+    pattern = re.compile(
+        r"<em\b(?=[^>]*class=['\"][^'\"]*\b(?:high|medium|low)\b[^'\"]*['\"])[^>]*>(.*?)</em>",
+        re.I | re.S,
+    )
+    for match in pattern.finditer(text):
+        fragments.append(clean_html_fragment(match.group(1)))
+    return fragments
+
+
 def dedupe_fragments(fragments, min_chars=28):
     seen = set()
     results = []
@@ -528,6 +539,7 @@ def extract_report_fragments_from_html(report_bytes):
         fragments.append(clean_html_fragment(match.group(1)))
     for match in re.finditer(r"<a[^>]*class=['\"][^'\"]*\bcl[123]\b[^'\"]*['\"][^>]*>(.*?)</a>", text, re.I | re.S):
         fragments.append(clean_html_fragment(match.group(1)))
+    fragments.extend(extract_paperyy_aigc_fragments_from_html(text))
 
     return dedupe_fragments(fragments)
 
