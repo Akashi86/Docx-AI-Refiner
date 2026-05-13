@@ -5,8 +5,11 @@ import html
 import io
 import json
 import re
+import shutil
 import time
+import uuid
 import zipfile
+from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import requests
@@ -32,7 +35,6 @@ for prefix, uri in NAMESPACES.items():
 
 W_NS = f"{{{NAMESPACES['w']}}}"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
-SEGMENT_RE = re.compile(r"<seg\s+id=\"(\d+)\">(.*?)</seg>", re.DOTALL)
 HEADING_LABEL_RE = re.compile(r"^(heading|标题|標題)\s*([12])$", re.IGNORECASE)
 SKIP_STYLE_KEYWORDS = (
     "title",
@@ -138,6 +140,8 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 if "processed_file" not in st.session_state:
     st.session_state.processed_file = None
+if "tracked_file" not in st.session_state:
+    st.session_state.tracked_file = None
 if "rewrite_report" not in st.session_state:
     st.session_state.rewrite_report = []
 
@@ -166,18 +170,16 @@ def render_logs(log_container):
     )
 
 
-def build_segment_payload(text_nodes):
-    parts = []
-    for idx, elem in enumerate(text_nodes):
-        text = elem.text or ""
-        parts.append(f'<seg id="{idx}">{html.escape(text, quote=False)}</seg>')
-    return "".join(parts)
-
-
 def element_xml(element):
     if element is None:
         return ""
     return ET.tostring(element, encoding="unicode")
+
+
+def clone_element(element):
+    if element is None:
+        return None
+    return ET.fromstring(ET.tostring(element, encoding="utf-8"))
 
 
 def is_pure_text_run(run):
@@ -230,28 +232,6 @@ def merge_adjacent_text_runs(parent):
     for child in list(parent):
         merged_count += merge_adjacent_text_runs(child)
     return merged_count
-
-
-def parse_segment_response(response_text, expected_count):
-    matches = SEGMENT_RE.findall(response_text.strip())
-    if len(matches) != expected_count:
-        raise ValueError(f"AI 返回了 {len(matches)} 个片段，但期望 {expected_count} 个。")
-
-    values = [None] * expected_count
-    seen = set()
-    for raw_id, raw_value in matches:
-        idx = int(raw_id)
-        if idx < 0 or idx >= expected_count:
-            raise ValueError(f"AI 返回了非法片段 id: {idx}")
-        if idx in seen:
-            raise ValueError(f"AI 重复返回了片段 id: {idx}")
-        seen.add(idx)
-        values[idx] = html.unescape(raw_value)
-
-    missing = [idx for idx, value in enumerate(values) if value is None]
-    if missing:
-        raise ValueError(f"AI 缺少片段 id: {missing}")
-    return values
 
 
 def make_diff_html_pair(old_text, new_text):
@@ -313,26 +293,79 @@ def report_to_csv(report):
     return output.getvalue().encode("utf-8-sig")
 
 
+def split_visible_paragraphs(text):
+    return [line.strip() for line in text.splitlines()]
+
+
+def paragraph_ref_only(paragraph_listing):
+    return paragraph_listing.split("|", 1)[0].strip()
+
+
+def generate_tracked_changes_docx(original_bytes, revised_bytes):
+    from docx_editor import Document
+
+    work_dir = Path("tmp") / "redline" / uuid.uuid4().hex
+    work_dir.mkdir(parents=True, exist_ok=False)
+    original_path = work_dir / "original.docx"
+    revised_path = work_dir / "revised.docx"
+    output_path = work_dir / "tracked.docx"
+
+    original_path.write_bytes(original_bytes)
+    revised_path.write_bytes(revised_bytes)
+
+    revised_doc = None
+    original_doc = None
+    try:
+        revised_doc = Document.open(revised_path, author="AI Refiner", force_recreate=True)
+        revised_paragraphs = split_visible_paragraphs(revised_doc.get_visible_text())
+        revised_doc.close(cleanup=False)
+        revised_doc = None
+
+        original_doc = Document.open(original_path, author="AI Refiner", force_recreate=True)
+        original_paragraphs = split_visible_paragraphs(original_doc.get_visible_text())
+        paragraph_refs = [
+            paragraph_ref_only(item) for item in original_doc.list_paragraphs(max_chars=0)
+        ]
+
+        count = min(len(original_paragraphs), len(revised_paragraphs), len(paragraph_refs))
+        rewrites = []
+        for idx in range(count):
+            old_text = original_paragraphs[idx]
+            new_text = revised_paragraphs[idx]
+            if old_text and old_text != new_text:
+                rewrites.append((paragraph_refs[idx], new_text))
+
+        if rewrites:
+            original_doc.batch_rewrite(rewrites)
+        original_doc.save(output_path)
+        original_doc.close(cleanup=False)
+        original_doc = None
+
+        return output_path.read_bytes(), len(rewrites)
+    finally:
+        if revised_doc is not None:
+            revised_doc.close(cleanup=False)
+        if original_doc is not None:
+            original_doc.close(cleanup=False)
+        try:
+            shutil.rmtree(work_dir)
+        except Exception:
+            pass
+
+
 def make_system_prompt(user_prompt, extra_instruction=""):
     retry_instruction = f"\n\n{extra_instruction}" if extra_instruction else ""
     return f"""{user_prompt}{retry_instruction}
 
-你会收到一段来自 Word 文档的 XML 片段化文本，格式如下：
-<seg id="0">...</seg><seg id="1">...</seg>
-
 请严格遵守：
-1. 只润色每个 <seg> 标签内部的正文。
-2. 必须保留所有 <seg id="..."> 和 </seg> 标签。
-3. 必须保持片段数量、id 数字和顺序完全不变。
-4. 不要添加解释、Markdown、代码块或额外文本。
-5. 不要合并、删除、拆分或重排任何 seg 标签。
-6. 标签外不能输出任何内容。
-7. 不要添加原文没有依据的新事实、数据、文献、引文或结论。
+1. 只返回改写后的正文段落。
+2. 不要添加解释、Markdown、代码块、标题或前后缀。
+3. 不要添加原文没有依据的新事实、数据、文献、引文或结论。
 """
 
 
 def call_deepseek(
-    segment_payload,
+    text,
     user_prompt,
     api_key,
     model_name,
@@ -347,7 +380,7 @@ def call_deepseek(
         "model": model_name,
         "messages": [
             {"role": "system", "content": make_system_prompt(user_prompt, extra_instruction)},
-            {"role": "user", "content": segment_payload},
+            {"role": "user", "content": text},
         ],
         "temperature": temperature,
     }
@@ -381,12 +414,55 @@ def call_deepseek(
     raise RuntimeError(f"段落 {task_id} 调用失败，已重试 {max_retries} 次：{last_error}")
 
 
-def paragraph_text_nodes(paragraph):
+def direct_text_runs(paragraph):
+    return [child for child in list(paragraph) if child.tag == f"{W_NS}r" and is_pure_text_run(child)]
+
+
+def paragraph_direct_text_nodes(paragraph):
     nodes = []
-    for text_elem in paragraph.iter(f"{W_NS}t"):
-        if text_elem.text:
-            nodes.append(text_elem)
+    for run in direct_text_runs(paragraph):
+        for text_elem in run_text_nodes(run):
+            if text_elem.text:
+                nodes.append(text_elem)
     return nodes
+
+
+def has_complex_inline_content(paragraph):
+    for child in list(paragraph):
+        if child.tag == f"{W_NS}pPr":
+            continue
+        if child.tag == f"{W_NS}r" and is_pure_text_run(child):
+            continue
+        return True
+    return False
+
+
+def run_format_flags(run):
+    r_pr = run.find(f"{W_NS}rPr")
+    if r_pr is None:
+        return {}
+    flags = {}
+    if r_pr.find(f"{W_NS}i") is not None:
+        flags["italic"] = True
+    if r_pr.find(f"{W_NS}b") is not None:
+        flags["bold"] = True
+    if r_pr.find(f"{W_NS}u") is not None:
+        flags["underline"] = True
+    return flags
+
+
+def formatted_terms_from_paragraph(paragraph):
+    terms = {}
+    for run in direct_text_runs(paragraph):
+        flags = run_format_flags(run)
+        if not flags:
+            continue
+        text = "".join(node.text or "" for node in run_text_nodes(run)).strip()
+        if len(text) < 2 or not re.search(r"[\w\u4e00-\u9fff]", text):
+            continue
+        existing = terms.setdefault(text, {})
+        existing.update(flags)
+    return [{"text": text, "flags": flags} for text, flags in terms.items()]
 
 
 def paragraph_plain_text(paragraph):
@@ -512,8 +588,11 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
             continue
         if not is_body_paragraph(paragraph, style_names):
             continue
+        if has_complex_inline_content(paragraph):
+            continue
 
-        text_nodes = paragraph_text_nodes(paragraph)
+        text_runs = direct_text_runs(paragraph)
+        text_nodes = paragraph_direct_text_nodes(paragraph)
         plain_text = "".join(elem.text or "" for elem in text_nodes).strip()
         if len(plain_text) < min_chars:
             continue
@@ -522,20 +601,84 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
             {
                 "paragraph_index": idx,
                 "page": current_page,
-                "text_nodes": text_nodes,
-                "segment_payload": build_segment_payload(text_nodes),
-                "segment_count": len(text_nodes),
+                "p_node": paragraph,
+                "text_runs": text_runs,
                 "plain_text": plain_text,
+                "formatted_terms": formatted_terms_from_paragraph(paragraph),
             }
         )
     return tasks
 
 
-def apply_segment_values(task, values):
-    for text_elem, new_text in zip(task["text_nodes"], values):
-        text_elem.text = new_text
-        if new_text.startswith(" ") or new_text.endswith(" "):
-            text_elem.set(XML_SPACE, "preserve")
+def ensure_run_format(r_pr, flags):
+    if flags.get("bold") and r_pr.find(f"{W_NS}b") is None:
+        ET.SubElement(r_pr, f"{W_NS}b")
+    if flags.get("italic") and r_pr.find(f"{W_NS}i") is None:
+        ET.SubElement(r_pr, f"{W_NS}i")
+    if flags.get("underline") and r_pr.find(f"{W_NS}u") is None:
+        underline = ET.SubElement(r_pr, f"{W_NS}u")
+        underline.set(f"{W_NS}val", "single")
+
+
+def make_text_run(text, base_r_pr=None, flags=None):
+    run = ET.Element(f"{W_NS}r")
+    r_pr = clone_element(base_r_pr)
+    flags = flags or {}
+    if flags:
+        if r_pr is None:
+            r_pr = ET.Element(f"{W_NS}rPr")
+        ensure_run_format(r_pr, flags)
+    if r_pr is not None:
+        run.append(r_pr)
+    text_elem = ET.SubElement(run, f"{W_NS}t")
+    if text.startswith(" ") or text.endswith(" "):
+        text_elem.set(XML_SPACE, "preserve")
+    text_elem.text = text
+    return run
+
+
+def split_text_by_terms(text, formatted_terms):
+    terms = sorted(
+        [term for term in formatted_terms if term["text"] and term["text"] in text],
+        key=lambda term: len(term["text"]),
+        reverse=True,
+    )
+    if not terms:
+        return [(text, {})]
+
+    pattern = re.compile("|".join(re.escape(term["text"]) for term in terms))
+    flags_by_text = {term["text"]: term["flags"] for term in terms}
+    pieces = []
+    last = 0
+    for match in pattern.finditer(text):
+        if match.start() > last:
+            pieces.append((text[last : match.start()], {}))
+        matched_text = match.group(0)
+        pieces.append((matched_text, flags_by_text.get(matched_text, {})))
+        last = match.end()
+    if last < len(text):
+        pieces.append((text[last:], {}))
+    return [(piece, flags) for piece, flags in pieces if piece]
+
+
+def rewrite_paragraph_text(task, new_text):
+    paragraph = task["p_node"]
+    runs = task["text_runs"]
+    if not runs:
+        raise ValueError("段落没有可写入的纯文本 run。")
+
+    children = list(paragraph)
+    first_index = children.index(runs[0])
+    base_r_pr = runs[0].find(f"{W_NS}rPr")
+    for run in runs:
+        paragraph.remove(run)
+
+    new_runs = [
+        make_text_run(piece, base_r_pr, flags)
+        for piece, flags in split_text_by_terms(new_text, task["formatted_terms"])
+    ]
+    for offset, run in enumerate(new_runs):
+        paragraph.insert(first_index + offset, run)
 
 
 def process_word(
@@ -552,6 +695,7 @@ def process_word(
 ):
     st.session_state.logs = []
     st.session_state.rewrite_report = []
+    st.session_state.tracked_file = None
 
     try:
         add_log("正在读取并解析 Word 文档。")
@@ -580,7 +724,7 @@ def process_word(
                 for task in tasks:
                     future = executor.submit(
                         call_deepseek,
-                        task["segment_payload"],
+                        task["plain_text"],
                         prompt,
                         api_key,
                         model_name,
@@ -598,14 +742,13 @@ def process_word(
                     para_no = task["paragraph_index"] + 1
                     try:
                         response_text = future.result()
-                        values = parse_segment_response(response_text, task["segment_count"])
                         original_text = task["plain_text"]
-                        new_text = "".join(values).strip()
+                        new_text = response_text.strip()
                         retry_error = ""
                         if original_text == new_text:
                             try:
                                 retry_response_text = call_deepseek(
-                                    task["segment_payload"],
+                                    task["plain_text"],
                                     prompt,
                                     api_key,
                                     model_name,
@@ -614,16 +757,12 @@ def process_word(
                                     extra_instruction=(
                                         "Your previous revision was identical to the original. "
                                         "Revise again with more substantial wording and sentence-level changes, "
-                                        "while preserving meaning, scholarly tone, and all seg tags."
+                                        "while preserving meaning, scholarly tone, and factual boundaries."
                                     ),
                                     max_retries=2,
                                 )
-                                retry_values = parse_segment_response(
-                                    retry_response_text, task["segment_count"]
-                                )
-                                retry_new_text = "".join(retry_values).strip()
+                                retry_new_text = retry_response_text.strip()
                                 if retry_new_text != original_text:
-                                    values = retry_values
                                     new_text = retry_new_text
                                     add_log(f"第 {para_no} 段首次无变化，已自动重试并改写。", "info")
                             except Exception as retry_exc:
@@ -634,7 +773,7 @@ def process_word(
                                 )
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
-                        apply_segment_values(task, values)
+                        rewrite_paragraph_text(task, new_text)
                         st.session_state.rewrite_report.append(
                             {
                                 "paragraph_index": para_no,
@@ -679,9 +818,16 @@ def process_word(
                 xml_str = ET.tostring(root, encoding="utf-8", xml_declaration=True)
                 out_zip.writestr("word/document.xml", xml_str)
 
-        add_log("新文档已打包完成。原段落、run 和样式结构没有被重建。", "success")
+        clean_docx = output_io.getvalue()
+        add_log("润色版文档已打包完成。原段落、run 和样式结构没有被重建。", "success")
+        try:
+            tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
+            st.session_state.tracked_file = tracked_docx
+            add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
+        except Exception as tracked_exc:
+            add_log(f"修订版生成失败，已保留润色版下载：{tracked_exc}", "warn")
         render_logs(log_container)
-        return output_io.getvalue()
+        return clean_docx
 
     except Exception as exc:
         add_log(f"处理流程发生异常：{exc}", "err")
@@ -754,6 +900,7 @@ with col_right:
             st.error("请填写有效的 DeepSeek API Key。")
         else:
             st.session_state.processed_file = None
+            st.session_state.tracked_file = None
             progress_bar.progress(0)
             result_bytes = process_word(
                 uploaded_file.getvalue(),
@@ -780,6 +927,14 @@ with col_right:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
             type="primary",
+        )
+    if st.session_state.tracked_file:
+        st.download_button(
+            label="下载带修订痕迹的 Word 文档",
+            data=st.session_state.tracked_file,
+            file_name=f"修订版_{uploaded_file.name if uploaded_file else 'document.docx'}",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
         )
 
 if st.session_state.rewrite_report:
