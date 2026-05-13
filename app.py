@@ -298,6 +298,7 @@ def report_to_csv(report):
             "page",
             "section",
             "section_type",
+            "write_mode",
             "risk_tags",
             "final_risk_tags",
             "original_text",
@@ -314,6 +315,7 @@ def report_to_csv(report):
                 "page": item.get("page", ""),
                 "section": item.get("section", ""),
                 "section_type": item.get("section_type", ""),
+                "write_mode": item.get("write_mode", ""),
                 "risk_tags": item.get("risk_tags", ""),
                 "final_risk_tags": item.get("final_risk_tags", ""),
                 "original_text": item.get("original_text", ""),
@@ -460,6 +462,10 @@ def paragraph_direct_text_nodes(paragraph):
             if text_elem.text:
                 nodes.append(text_elem)
     return nodes
+
+
+def paragraph_all_text_nodes(paragraph):
+    return [elem for elem in paragraph.iter(f"{W_NS}t") if elem.text]
 
 
 def has_complex_inline_content(paragraph):
@@ -641,11 +647,13 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
             continue
         if not is_body_paragraph(paragraph, style_names):
             continue
-        if has_complex_inline_content(paragraph):
-            continue
-
         text_runs = direct_text_runs(paragraph)
-        text_nodes = paragraph_direct_text_nodes(paragraph)
+        has_complex_content = has_complex_inline_content(paragraph)
+        text_nodes = (
+            paragraph_all_text_nodes(paragraph)
+            if has_complex_content
+            else paragraph_direct_text_nodes(paragraph)
+        )
         plain_text = "".join(elem.text or "" for elem in text_nodes).strip()
         if len(plain_text) < min_chars:
             continue
@@ -656,7 +664,9 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
                 "page": current_page,
                 "p_node": paragraph,
                 "text_runs": text_runs,
+                "text_nodes": text_nodes,
                 "plain_text": plain_text,
+                "write_mode": "text_nodes_fallback" if has_complex_content else "rebuild_runs",
                 "section_heading": current_heading,
                 "section_type": current_section_type,
                 "risk_profile": analyze_ai_risk(plain_text, current_section_type),
@@ -718,6 +728,21 @@ def split_text_by_terms(text, formatted_terms):
 
 
 def rewrite_paragraph_text(task, new_text):
+    if task.get("write_mode") == "text_nodes_fallback":
+        text_nodes = task.get("text_nodes", [])
+        if not text_nodes:
+            raise ValueError("Paragraph has no writable text nodes.")
+        first_node = text_nodes[0]
+        first_node.text = new_text
+        if new_text.startswith(" ") or new_text.endswith(" "):
+            first_node.set(XML_SPACE, "preserve")
+        elif XML_SPACE in first_node.attrib:
+            first_node.attrib.pop(XML_SPACE, None)
+        for node in text_nodes[1:]:
+            node.text = ""
+            node.attrib.pop(XML_SPACE, None)
+        return
+
     paragraph = task["p_node"]
     runs = task["text_runs"]
     if not runs:
@@ -967,6 +992,14 @@ def process_word(
                 return None
 
             add_log(f"共找到 {len(tasks)} 个待处理段落，开始 {concurrency} 并发处理。", "info")
+            fallback_count = sum(
+                1 for task in tasks if task.get("write_mode") == "text_nodes_fallback"
+            )
+            if fallback_count:
+                add_log(
+                    f"{fallback_count} paragraphs contain complex inline structure and will use fallback text-node writing.",
+                    "warn",
+                )
             render_logs(log_container)
 
             completed_tasks = 0
@@ -1104,6 +1137,7 @@ def process_word(
                                 "error": retry_error if status == "unchanged" else "",
                                 "section": task["section_heading"],
                                 "section_type": task["section_type"],
+                                "write_mode": task.get("write_mode", ""),
                                 "risk_tags": ", ".join(task["risk_profile"]["tags"]),
                                 "final_risk_tags": ", ".join(final_risk["tags"]),
                             }
@@ -1125,6 +1159,7 @@ def process_word(
                                 "error": str(exc),
                                 "section": task.get("section_heading", ""),
                                 "section_type": task.get("section_type", ""),
+                                "write_mode": task.get("write_mode", ""),
                                 "risk_tags": ", ".join(task.get("risk_profile", {}).get("tags", [])),
                                 "final_risk_tags": "",
                             }
