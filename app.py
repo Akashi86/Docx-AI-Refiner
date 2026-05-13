@@ -33,6 +33,7 @@ for prefix, uri in NAMESPACES.items():
 W_NS = f"{{{NAMESPACES['w']}}}"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 SEGMENT_RE = re.compile(r"<seg\s+id=\"(\d+)\">(.*?)</seg>", re.DOTALL)
+HEADING_LABEL_RE = re.compile(r"^(heading|标题|標題)\s*([12])$", re.IGNORECASE)
 SKIP_STYLE_KEYWORDS = (
     "title",
     "heading",
@@ -169,6 +170,64 @@ def build_segment_payload(text_nodes):
         text = elem.text or ""
         parts.append(f'<seg id="{idx}">{html.escape(text, quote=False)}</seg>')
     return "".join(parts)
+
+
+def element_xml(element):
+    if element is None:
+        return ""
+    return ET.tostring(element, encoding="unicode")
+
+
+def is_pure_text_run(run):
+    if run.tag != f"{W_NS}r":
+        return False
+    text_children = 0
+    for child in list(run):
+        if child.tag == f"{W_NS}rPr":
+            continue
+        if child.tag != f"{W_NS}t":
+            return False
+        text_children += 1
+    return text_children > 0
+
+
+def run_style_key(run):
+    return element_xml(run.find(f"{W_NS}rPr"))
+
+
+def run_text_nodes(run):
+    return [child for child in list(run) if child.tag == f"{W_NS}t"]
+
+
+def merge_adjacent_text_runs(parent):
+    merged_count = 0
+    children = list(parent)
+    idx = 0
+    while idx < len(children) - 1:
+        current = children[idx]
+        nxt = children[idx + 1]
+        if (
+            is_pure_text_run(current)
+            and is_pure_text_run(nxt)
+            and run_style_key(current) == run_style_key(nxt)
+        ):
+            current_text_nodes = run_text_nodes(current)
+            next_text_nodes = run_text_nodes(nxt)
+            if current_text_nodes and next_text_nodes:
+                target = current_text_nodes[-1]
+                appended_text = "".join(node.text or "" for node in next_text_nodes)
+                target.text = (target.text or "") + appended_text
+                if target.text.startswith(" ") or target.text.endswith(" "):
+                    target.set(XML_SPACE, "preserve")
+                parent.remove(nxt)
+                children.pop(idx + 1)
+                merged_count += 1
+                continue
+        idx += 1
+
+    for child in list(parent):
+        merged_count += merge_adjacent_text_runs(child)
+    return merged_count
 
 
 def parse_segment_response(response_text, expected_count):
@@ -331,6 +390,79 @@ def paragraph_style_id(paragraph):
     return p_style.get(f"{W_NS}val", "")
 
 
+def read_style_names(doc_zip):
+    style_names = {}
+    try:
+        styles_root = ET.fromstring(doc_zip.read("word/styles.xml"))
+    except Exception:
+        return style_names
+
+    for style in styles_root.findall(f"{W_NS}style"):
+        style_id = style.get(f"{W_NS}styleId", "")
+        name = style.find(f"{W_NS}name")
+        if style_id and name is not None:
+            style_names[style_id] = name.get(f"{W_NS}val", "")
+    return style_names
+
+
+def paragraph_style_label(paragraph, style_names):
+    style_id = paragraph_style_id(paragraph)
+    style_name = style_names.get(style_id, "")
+    return f"{style_id} {style_name}".strip()
+
+
+def heading_level(paragraph, style_names):
+    label = paragraph_style_label(paragraph, style_names).replace("_", " ").strip()
+    compact_label = re.sub(r"\s+", "", label).lower()
+    if "heading1" in compact_label or "标题1" in compact_label or "標題1" in compact_label:
+        return 1
+    if "heading2" in compact_label or "标题2" in compact_label or "標題2" in compact_label:
+        return 2
+
+    match = HEADING_LABEL_RE.match(re.sub(r"\s+", " ", label).strip())
+    if match:
+        return int(match.group(2))
+    return None
+
+
+def extract_headings_from_docx(file_bytes):
+    headings = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as doc_zip:
+            root = ET.fromstring(doc_zip.read("word/document.xml"))
+            style_names = read_style_names(doc_zip)
+    except Exception:
+        return headings
+
+    for idx, paragraph in enumerate(root.iter(f"{W_NS}p")):
+        level = heading_level(paragraph, style_names)
+        if level not in (1, 2):
+            continue
+        text = paragraph_plain_text(paragraph)
+        if not text:
+            continue
+        heading_no = len(headings) + 1
+        headings.append(
+            {
+                "label": f"{heading_no}. H{level} - {text[:80]}",
+                "paragraph_index": idx,
+                "level": level,
+                "text": text,
+            }
+        )
+    return headings
+
+
+def heading_section_end(headings, heading_position):
+    if heading_position is None:
+        return None
+    current = headings[heading_position]
+    for next_heading in headings[heading_position + 1 :]:
+        if next_heading["level"] <= current["level"]:
+            return next_heading["paragraph_index"]
+    return None
+
+
 def paragraph_page_number(paragraph, current_page):
     page_breaks = len(paragraph.findall(f".//{W_NS}lastRenderedPageBreak"))
     for br in paragraph.findall(f".//{W_NS}br"):
@@ -339,12 +471,13 @@ def paragraph_page_number(paragraph, current_page):
     return current_page + page_breaks
 
 
-def is_body_paragraph(paragraph):
+def is_body_paragraph(paragraph, style_names=None):
+    style_names = style_names or {}
     text = paragraph_plain_text(paragraph)
     if not text:
         return False
-    style_id = paragraph_style_id(paragraph).lower()
-    if any(keyword in style_id for keyword in SKIP_STYLE_KEYWORDS):
+    style_label = paragraph_style_label(paragraph, style_names).lower()
+    if any(keyword in style_label for keyword in SKIP_STYLE_KEYWORDS):
         return False
     compact_text = re.sub(r"\s+", " ", text).strip()
     if TITLE_LIKE_RE.match(compact_text) and len(compact_text) <= 80:
@@ -354,17 +487,17 @@ def is_body_paragraph(paragraph):
     return True
 
 
-def collect_tasks(root, start_page, end_page, min_chars):
+def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index, min_chars):
     tasks = []
     current_page = 1
-    end_page_num = end_page if end_page else float("inf")
+    end_index = end_paragraph_index if end_paragraph_index is not None else float("inf")
 
     paragraphs = list(root.iter(f"{W_NS}p"))
     for idx, paragraph in enumerate(paragraphs):
         current_page = paragraph_page_number(paragraph, current_page)
-        if current_page < start_page or current_page > end_page_num:
+        if idx <= start_paragraph_index or idx >= end_index:
             continue
-        if not is_body_paragraph(paragraph):
+        if not is_body_paragraph(paragraph, style_names):
             continue
 
         text_nodes = paragraph_text_nodes(paragraph)
@@ -397,8 +530,8 @@ def process_word(
     api_key,
     model_name,
     concurrency,
-    start_page,
-    end_page,
+    start_paragraph_index,
+    end_paragraph_index,
     min_chars,
     prompt,
     log_container,
@@ -415,9 +548,11 @@ def process_word(
         with zipfile.ZipFile(input_buffer, "r") as doc_zip:
             xml_content = doc_zip.read("word/document.xml")
             root = ET.fromstring(xml_content)
+            style_names = read_style_names(doc_zip)
+            merged_count = merge_adjacent_text_runs(root)
 
-            add_log("正在扫描正文段落并生成 AI 任务。")
-            tasks = collect_tasks(root, start_page, end_page, min_chars)
+            add_log(f"已合并 {merged_count} 个相邻同样式纯文本 run，正在扫描正文段落。")
+            tasks = collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index, min_chars)
             if not tasks:
                 add_log("在设定范围内没有找到符合长度要求的正文段落。", "warn")
                 render_logs(log_container)
@@ -529,19 +664,35 @@ with col_left:
         help="建议 2-4。并发过高可能触发 API 限流。",
     )
 
-    col_3, col_4 = st.columns(2)
-    start_page = col_3.number_input("开始页", min_value=1, value=1)
-    end_page_input = col_4.number_input("结束页，0 表示到末尾", min_value=0, value=0)
-    end_page = int(end_page_input) if end_page_input > 0 else None
+    st.subheader("2. 上传文档")
+    uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
 
-    min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=20, step=5)
+    headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
+    heading_labels = [heading["label"] for heading in headings]
+    heading_lookup = {heading["label"]: idx for idx, heading in enumerate(headings)}
 
-    st.subheader("2. 润色提示词")
+    st.subheader("3. 章节范围")
+    if headings:
+        start_heading_label = st.selectbox("从哪个章节开始润色", ["全文开头"] + heading_labels)
+        end_heading_label = st.selectbox("到哪个章节结束", ["全文末尾"] + heading_labels)
+
+        start_heading_pos = heading_lookup.get(start_heading_label)
+        end_heading_pos = heading_lookup.get(end_heading_label)
+        start_paragraph_index = headings[start_heading_pos]["paragraph_index"] if start_heading_pos is not None else -1
+        end_paragraph_index = heading_section_end(headings, end_heading_pos) if end_heading_pos is not None else None
+
+        if end_heading_pos is not None and headings[end_heading_pos]["paragraph_index"] <= start_paragraph_index:
+            st.warning("结束章节位于开始章节之前，当前范围可能没有可处理正文。")
+    else:
+        start_paragraph_index = -1
+        end_paragraph_index = None
+        st.info("未识别到 Heading 1/2，将默认处理全文正文。")
+
+    min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=30, step=5)
+
+    st.subheader("4. 润色提示词")
     prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
     prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
-
-    st.subheader("3. 上传文档")
-    uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
 
 with col_right:
     st.subheader("运行日志")
@@ -561,12 +712,12 @@ with col_right:
             st.session_state.processed_file = None
             progress_bar.progress(0)
             result_bytes = process_word(
-                uploaded_file.read(),
+                uploaded_file.getvalue(),
                 api_key,
                 model_name,
                 concurrency,
-                start_page,
-                end_page,
+                start_paragraph_index,
+                end_paragraph_index,
                 min_chars,
                 prompt,
                 log_container,
