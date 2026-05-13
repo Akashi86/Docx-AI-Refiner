@@ -49,30 +49,10 @@ TITLE_LIKE_RE = re.compile(
     re.IGNORECASE,
 )
 PROMPT_TEMPLATES = {
-    "降 AI 率（英文）": """Without changing the paragraph structure or the order of information, rewrite the text below to reduce Al vibes. Do not start sentences with generic stock phrases ("in conclusion," "moreover," etc.); use more specific, context-tied transitions instead. Make each paragraph's first sentence feel like a natural continuation of the previous one. Favor concrete verbs over stacks of abstract nouns, keep terminology precise, and split long sentences into 2- 3 shorter ones.""",
-    "降 AI 率（中文）": """请在不改变段落结构与信息顺序的前提下，重写下面文本以降低 AI 痕迹：同一句不要用常见的套话开头（如“综上所述”“此外”），改用更具体的衔接方式；让每段首句更像“承接上文”的自然过渡。多用具体动词，少用抽象名词堆叠。保持术语准确，但把长句拆成 2-3 个短句。""",
-    "学术润色（英文）": """Act as an experienced academic editor. Paraphrase the following text without changing the paragraph structure, information order, claims, evidence, terminology, citations, or scholarly rigor.
-
-Syntactic variation: Vary sentence openings and sentence length. Use active voice where it improves clarity, but keep passive voice when it is more appropriate for academic convention.
-
-Vocabulary shift: Avoid generic academic filler and statistically obvious phrasing. Prefer precise, domain-specific wording that reflects the topic rather than broad generalization.
-
-Logic and transitions: Make transitions specific to the argument instead of relying on formulaic connectors such as "moreover," "in addition," or "in conclusion." Preserve the original reasoning, but make the progression feel written by a careful human editor.
-
-Specificity: Keep concrete details, named concepts, examples, and technical distinctions. Do not invent facts, sources, data, or citations.
-
-Return only the revised paragraph.""",
-    "深度自然化（英文）": """Rewrite the paragraph below with a human-first academic style while preserving its meaning, paragraph structure, information order, terminology, citations, and factual boundaries.
-
-Texture: Add natural variation in rhythm, punctuation, and phrasing. Use dashes or semicolons only when they genuinely improve readability.
-
-Uneven but controlled rhythm: Avoid overly balanced, template-like academic prose. Let some sentences carry dense information while others clarify the point more directly.
-
-Word choice: Replace generic or predictable phrasing with more descriptive and context-sensitive wording, but do not make the prose ornate or imprecise.
-
-Scholarly restraint: Keep the tone appropriate for a thesis or research report. Do not add metaphors, rhetorical questions, claims, examples, or interpretations unless they are already supported by the source paragraph.
-
-Return only the revised paragraph.""",
+    "降 AI 率（英文）": """Rewrite the text to sound more natural, less formulaic, and less machine-generated. Avoid generic transitions such as "moreover," "in conclusion," and "to build upon" when a more specific connection is possible. Vary sentence openings and sentence length. Use concrete verbs, reduce abstract noun stacks, and make the argument flow in a way that feels written by a careful human academic writer. Split long sentences where helpful, and revise wording substantially rather than returning the original phrasing.""",
+    "降 AI 率（中文）": """请重写下面文本，使表达更自然、更少模板感和机器生成痕迹。避免使用“综上所述”“此外”“进一步而言”等套话式衔接，尽量改用更贴合上下文的过渡方式。调整句式开头和句长，多用具体动词，减少抽象名词堆叠。必要时拆分长句，并进行实质性改写，不要原样返回。""",
+    "学术润色（英文）": """Act as an experienced academic editor. Rewrite the text with clearer, more varied, and more natural scholarly prose. Replace formulaic transitions with context-specific links, vary sentence rhythm, and use more precise domain-aware wording. Keep the scholarly tone, but revise the wording substantially rather than polishing only a few words.""",
+    "深度自然化（英文）": """Rewrite the text with a human-first academic style. Make the prose less balanced, less predictable, and less template-like while keeping it suitable for a thesis or research report. Vary rhythm, sentence openings, and punctuation where useful. Replace generic phrasing with context-sensitive wording, and make substantial sentence-level revisions.""",
 }
 
 
@@ -333,8 +313,9 @@ def report_to_csv(report):
     return output.getvalue().encode("utf-8-sig")
 
 
-def make_system_prompt(user_prompt):
-    return f"""{user_prompt}
+def make_system_prompt(user_prompt, extra_instruction=""):
+    retry_instruction = f"\n\n{extra_instruction}" if extra_instruction else ""
+    return f"""{user_prompt}{retry_instruction}
 
 你会收到一段来自 Word 文档的 XML 片段化文本，格式如下：
 <seg id="0">...</seg><seg id="1">...</seg>
@@ -346,19 +327,29 @@ def make_system_prompt(user_prompt):
 4. 不要添加解释、Markdown、代码块或额外文本。
 5. 不要合并、删除、拆分或重排任何 seg 标签。
 6. 标签外不能输出任何内容。
+7. 不要添加原文没有依据的新事实、数据、文献、引文或结论。
 """
 
 
-def call_deepseek(segment_payload, user_prompt, api_key, model_name, task_id, max_retries=3):
+def call_deepseek(
+    segment_payload,
+    user_prompt,
+    api_key,
+    model_name,
+    task_id,
+    temperature=0.4,
+    extra_instruction="",
+    max_retries=3,
+):
     url = "https://api.deepseek.com/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": make_system_prompt(user_prompt)},
+            {"role": "system", "content": make_system_prompt(user_prompt, extra_instruction)},
             {"role": "user", "content": segment_payload},
         ],
-        "temperature": 0.2,
+        "temperature": temperature,
     }
 
     last_error = None
@@ -610,6 +601,37 @@ def process_word(
                         values = parse_segment_response(response_text, task["segment_count"])
                         original_text = task["plain_text"]
                         new_text = "".join(values).strip()
+                        retry_error = ""
+                        if original_text == new_text:
+                            try:
+                                retry_response_text = call_deepseek(
+                                    task["segment_payload"],
+                                    prompt,
+                                    api_key,
+                                    model_name,
+                                    para_no,
+                                    temperature=0.5,
+                                    extra_instruction=(
+                                        "Your previous revision was identical to the original. "
+                                        "Revise again with more substantial wording and sentence-level changes, "
+                                        "while preserving meaning, scholarly tone, and all seg tags."
+                                    ),
+                                    max_retries=2,
+                                )
+                                retry_values = parse_segment_response(
+                                    retry_response_text, task["segment_count"]
+                                )
+                                retry_new_text = "".join(retry_values).strip()
+                                if retry_new_text != original_text:
+                                    values = retry_values
+                                    new_text = retry_new_text
+                                    add_log(f"第 {para_no} 段首次无变化，已自动重试并改写。", "info")
+                            except Exception as retry_exc:
+                                retry_error = str(retry_exc)
+                                add_log(
+                                    f"第 {para_no} 段无变化重试失败，保留第一次合法结果：{retry_exc}",
+                                    "warn",
+                                )
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         apply_segment_values(task, values)
@@ -622,7 +644,7 @@ def process_word(
                                 "old_diff_html": diff_html["old_html"],
                                 "new_diff_html": diff_html["new_html"],
                                 "status": status,
-                                "error": "",
+                                "error": retry_error if status == "unchanged" else "",
                             }
                         )
                         if status == "changed":
