@@ -69,7 +69,7 @@ CASUAL_REWRITE_RE = re.compile(
     re.IGNORECASE,
 )
 PROMPT_TEMPLATES = {
-    "中国学生 GRE 代入法": """你是一个中国的学生，你刚刚通过了gre考试，作文的分数为3，这是你的水平。请你针对以下的英文内容进行重写，想尽力写出大概4分左右水平的英文作文，请记住你是一个中国大学生，可能词汇量和语言习惯和其他国家的学生不同，请你切实的代入后进行写作，减少ai风格的语言习惯，切实代入人类学生，减少模版写作的痕迹，在写作时加入一定的个人色彩。可以在语言上显示出瑕疵，但是你的学术态度端正，请你展现出这种不完美和瑕疵感。注意保留原有的专业术语、数字和引用，不要随意增加或删除客观事实。仅返回重写后的段落文本，不要添加任何Markdown格式（如星号等）。""",
+    "中国学生 GRE 代入法": """你是一个中国的学生，你刚刚通过了gre考试，作文的分数为3，这是你的水平。请你针对以下的英文内容进行重写，想尽力写出大概4分左右水平的英文作文，请记住你是一个中国大学生，可能词汇量和语言习惯和其他国家的学生不同，请你切实的代入后进行写作，减少ai风格的语言习惯，切实代入人类学生，减少模版写作的痕迹，在写作时加入一定的个人色彩。可以在语言上显示出瑕疵，但是你的学术态度端正，请你展现出这种不完美和瑕疵感。注意保留原有的专业术语、数字和引用，不要随意增加或删除客观事实。仅返回重写后的段落文本，不要添加任何Markdown格式（如星号等）原本是中文的不要变成英文""",
     "降 AI 率（英文）": """You are a professional AIGC-rate reduction tool. Rewrite the paragraph according to the following rules. The primary goal is to reduce AIGC-like writing while preserving academic professionalism.
 
 Core requirements:
@@ -1112,7 +1112,7 @@ def suspicious_rewrite_reason(original_text, new_text, enforce_format_safety=Tru
         return "protected_text_changed"
     if enforce_format_safety and "*" not in original_compact and "*" in new_compact:
         return "markdown_formatting_added"
-    if CASUAL_REWRITE_RE.search(new_compact):
+    if enforce_format_safety and CASUAL_REWRITE_RE.search(new_compact):
         return "casual_rewrite_phrase"
     if not ends_with_sentence_punctuation(original_compact) and ends_with_sentence_punctuation(new_compact):
         if new_words > max(20, int(original_words * 1.6)):
@@ -2186,8 +2186,8 @@ with col_left:
     enforce_format_safety = st.checkbox(
         "启用格式安全阀",
         value=True,
-        help="开启时，如果输出在原文没有星号的段落里新增 Markdown 星号，会拒绝写回；"
-             "关闭后仍保留标题保护、过长扩写等内容安全阀。",
+        help="开启时，如果输出在原文没有星号的段落里新增 Markdown 星号，或使用了过于随意的口语化词组（如 don't, can't 等），会拒绝写回；"
+             "关闭后将不再拦截这些，但仍保留标题保护、过长扩写等内容安全阀。",
     )
 
 with col_right:
