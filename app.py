@@ -51,10 +51,27 @@ TITLE_LIKE_RE = re.compile(
     re.IGNORECASE,
 )
 PROMPT_TEMPLATES = {
-    "降 AI 率（英文）": """Rewrite the text to sound more natural, less formulaic, and less machine-generated, at a level appropriate for an undergraduate thesis. The style may be slightly more conversational, but it must remain professional and academically acceptable. Preserve specialized terms, proper nouns, titles, names, citations, and key concepts. If a sentence contains many proper nouns or technical terms and is hard to reshape, simplify it and compress its length. If a sentence contains few proper nouns or technical terms, expand it where useful and make the expression more detailed. In all cases, keep the central meaning unchanged and replace the original wording with synonymous, context-appropriate expressions. Avoid generic transitions such as "moreover," "in conclusion," and "to build upon" when a more specific connection is possible. Vary sentence openings and sentence length. Use concrete verbs, reduce abstract noun stacks, split long sentences where helpful, and revise wording substantially rather than returning the original phrasing, and other treatments used to reduce the AIGC rate.""",
+    "降 AI 率（英文）": """Rewrite the paragraph as if a real undergraduate thesis writer revised their own draft, not as if an editor polished it. Keep the meaning, evidence, names, citations, terminology, and paragraph-level order, but rebuild the wording and sentence structure substantially.
+
+Avoid the common AI-polished style: do not make every sentence equally smooth, balanced, or explanatory. Do not add broad summary phrases, generic transitions, inflated academic nouns, or neat three-part logic unless the source already needs them. Prefer concrete verbs and context-specific links. Let some sentences stay short and direct; let others carry detail where the source requires it. Keep the tone academically acceptable, but allow a modest amount of natural unevenness and authorial judgment.
+
+When rewriting, change more than synonyms: vary subjects, verbs, sentence openings, and clause order; compress filler; split or combine sentences only where it improves the paragraph. Return only the rewritten paragraph.""",
     "降 AI 率（中文）": """请重写下面文本，使表达更自然、更少模板感和机器生成痕迹。避免使用“综上所述”“此外”“进一步而言”等套话式衔接，尽量改用更贴合上下文的过渡方式。调整句式开头和句长，多用具体动词，减少抽象名词堆叠。必要时拆分长句，并进行实质性改写，不要原样返回。""",
     "学术润色（英文）": """Act as an experienced academic editor. Rewrite the text with clearer, more varied, and more natural scholarly prose. Replace formulaic transitions with context-specific links, vary sentence rhythm, and use more precise domain-aware wording. Keep the scholarly tone, but revise the wording substantially rather than polishing only a few words.""",
-    "深度自然化（英文）": """Rewrite the text with a human-first academic style. Make the prose less balanced, less predictable, and less template-like while keeping it suitable for a thesis or research report. Vary rhythm, sentence openings, and punctuation where useful. Replace generic phrasing with context-sensitive wording, and make substantial sentence-level revisions.""",
+    "深度自然化（英文）": """Rewrite the paragraph with a stronger human-draft style while keeping it suitable for a thesis or research report. Preserve the original meaning, facts, citations, and technical terms, but make the wording feel as though the author reconsidered the paragraph instead of running it through a polishing tool.
+
+Use deeper sentence-level changes. Move clauses around, change the grammatical subject when it helps, remove empty setup phrases, replace abstract noun stacks with direct verbs, and avoid predictable transitions such as "moreover," "furthermore," "in addition," "overall," "it is important to note," and "this highlights." Do not over-improve the prose into a uniformly fluent AI style. Keep a natural academic rhythm with varied sentence lengths and occasional plain phrasing. Return only the rewritten paragraph.""",
+    "深度降 AI（英文强改写）": """Rewrite this paragraph aggressively enough that it reads like a human author's second draft, while preserving the same claim, evidence, citations, terminology, and order of information.
+
+Important style target:
+- Do not produce glossy, generic, perfectly balanced academic prose.
+- Avoid formulaic connectors, broad concluding language, and repeated sentence frames.
+- Remove filler and stock phrasing instead of replacing it with new stock phrasing.
+- Use concrete verbs and specific links to the local context.
+- Vary sentence length and syntax naturally; some sentences may be plain and compact.
+- If the source is wordy, compress it. If the source is thin, add only small clarifying detail that is already implied by the paragraph.
+
+Make substantial structural and lexical changes, not just synonym swaps. Return only the rewritten paragraph.""",
 }
 
 
@@ -362,6 +379,8 @@ def make_system_prompt(user_prompt, extra_instruction=""):
 2. 不要添加解释、Markdown、代码块、标题或前后缀。
 3. 不要添加原文没有依据的新事实、数据、文献、引文或结论。
 4. 必须保持与输入文本相同的主体语言。若输入主要是英文，改写后也必须是英文；不要把段落翻译成另一种语言，除非用户明确要求翻译。中文术语、标题、人名或引文可以按原样保留。
+5. 不要把文本改成过度工整、过度平滑、处处对称的 AI 润色腔。宁可保留适度自然的不均匀节奏，也不要生成模板化套话。
+6. 如果原文有具体上下文，优先用上下文内的衔接方式，不要使用空泛连接词或泛泛总结句。
 """
 
 
@@ -710,6 +729,7 @@ def process_word(
     end_paragraph_index,
     min_chars,
     prompt,
+    rewrite_temperature,
     log_container,
     progress_bar,
 ):
@@ -749,6 +769,7 @@ def process_word(
                         api_key,
                         model_name,
                         task["paragraph_index"] + 1,
+                        rewrite_temperature,
                     )
                     future_to_task[future] = task
                     add_log(
@@ -773,7 +794,7 @@ def process_word(
                                     api_key,
                                     model_name,
                                     para_no,
-                                    temperature=0.5,
+                                    temperature=min(rewrite_temperature + 0.1, 0.85),
                                     extra_instruction=(
                                         "Your previous revision was identical to the original. "
                                         "Revise again with more substantial wording and sentence-level changes, "
@@ -905,6 +926,18 @@ with col_left:
     st.subheader("4. 润色提示词")
     prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
     prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
+    rewrite_strength = st.selectbox(
+        "改写强度",
+        ["标准降 AI", "深度降 AI", "最大强改写"],
+        index=1,
+        help="强度越高，句式和措辞变化越大；如果检测结果仍偏高，优先尝试“最大强改写”。",
+    )
+    temperature_by_strength = {
+        "标准降 AI": 0.55,
+        "深度降 AI": 0.68,
+        "最大强改写": 0.78,
+    }
+    rewrite_temperature = temperature_by_strength[rewrite_strength]
 
 with col_right:
     st.subheader("运行日志")
@@ -933,6 +966,7 @@ with col_right:
                 end_paragraph_index,
                 min_chars,
                 prompt,
+                rewrite_temperature,
                 log_container,
                 progress_bar,
             )
