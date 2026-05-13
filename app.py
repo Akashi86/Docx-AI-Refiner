@@ -332,6 +332,9 @@ def report_to_csv(report):
             "section",
             "section_type",
             "write_mode",
+            "rewrite_rounds",
+            "second_rewrite_applied",
+            "reject_reason",
             "risk_tags",
             "final_risk_tags",
             "original_text",
@@ -349,6 +352,9 @@ def report_to_csv(report):
                 "section": item.get("section", ""),
                 "section_type": item.get("section_type", ""),
                 "write_mode": item.get("write_mode", ""),
+                "rewrite_rounds": item.get("rewrite_rounds", ""),
+                "second_rewrite_applied": item.get("second_rewrite_applied", ""),
+                "reject_reason": item.get("reject_reason", ""),
                 "risk_tags": item.get("risk_tags", ""),
                 "final_risk_tags": item.get("final_risk_tags", ""),
                 "original_text": item.get("original_text", ""),
@@ -716,7 +722,12 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
         elif re.match(r"^chapter\s+one\b", compact_paragraph_text, re.IGNORECASE):
             current_heading = compact_paragraph_text
             current_section_type = "introduction"
+        elif re.match(r"^(references?|bibliography|参考文献)\b", compact_paragraph_text, re.IGNORECASE):
+            current_heading = compact_paragraph_text
+            current_section_type = "references"
         if idx <= start_paragraph_index or idx >= end_index:
+            continue
+        if current_section_type == "references":
             continue
         if not is_body_paragraph(paragraph, style_names):
             continue
@@ -835,25 +846,29 @@ def rewrite_paragraph_text(task, new_text):
         paragraph.insert(first_index + offset, run)
 
 
-def is_suspicious_expansion(original_text, new_text):
+def suspicious_rewrite_reason(original_text, new_text):
     original_words = word_count(original_text)
     new_words = word_count(new_text)
     original_compact = re.sub(r"\s+", " ", original_text).strip()
     new_compact = re.sub(r"\s+", " ", new_text).strip()
     if should_skip_protected_text(original_compact) and original_compact != new_compact:
-        return True
+        return "protected_text_changed"
     if "*" not in original_compact and "*" in new_compact:
-        return True
+        return "markdown_formatting_added"
     if CASUAL_REWRITE_RE.search(new_compact):
-        return True
+        return "casual_rewrite_phrase"
     if not ends_with_sentence_punctuation(original_compact) and ends_with_sentence_punctuation(new_compact):
         if new_words > max(20, int(original_words * 1.6)):
-            return True
+            return "title_or_label_expanded"
     if original_words < 20 and new_words > max(30, int(original_words * 2.5)):
-        return True
+        return "short_text_expanded"
     if original_words >= 30 and new_words > int(original_words * 1.45):
-        return True
-    return False
+        return "rewrite_too_long"
+    return ""
+
+
+def is_suspicious_expansion(original_text, new_text):
+    return bool(suspicious_rewrite_reason(original_text, new_text))
 
 
 AI_RISK_RULES = (
@@ -909,6 +924,8 @@ DATA_RE = re.compile(r"\d+(?:\.\d+)?\s*%|\b\d+(?:\.\d+)?\b")
 
 def detect_section_type(heading_text):
     heading = (heading_text or "").lower()
+    if re.search(r"\b(references?|bibliography)\b|参考文献", heading, re.IGNORECASE):
+        return "references"
     if "abstract" in heading:
         return "abstract"
     if "introduction" in heading:
@@ -1136,11 +1153,17 @@ def process_word(
                 for future in concurrent.futures.as_completed(future_to_task):
                     task = future_to_task[future]
                     para_no = task["paragraph_index"] + 1
+                    rewrite_rounds = ""
+                    second_rewrite_applied = False
+                    reject_reason = ""
                     try:
                         response_text = future.result()
                         original_text = task["plain_text"]
                         new_text = response_text.strip()
                         retry_error = ""
+                        rewrite_rounds = 1
+                        second_rewrite_applied = False
+                        reject_reason = ""
                         if original_text == new_text:
                             try:
                                 retry_response_text = call_deepseek(
@@ -1162,6 +1185,7 @@ def process_word(
                                 retry_new_text = retry_response_text.strip()
                                 if retry_new_text != original_text:
                                     new_text = retry_new_text
+                                    rewrite_rounds += 1
                                     add_log(f"第 {para_no} 段首次无变化，已自动重试并改写。", "info")
                             except Exception as retry_exc:
                                 retry_error = str(retry_exc)
@@ -1205,8 +1229,10 @@ def process_word(
                                     retry_new_text = retry_response_text.strip()
                                     if retry_new_text and retry_new_text != original_text:
                                         new_text = retry_new_text
+                                        rewrite_rounds += 1
+                                        second_rewrite_applied = True
                                         add_log(
-                                            f"Paragraph {para_no}: detector-prone patterns remained, so a second rewrite was applied.",
+                                            f"第 {para_no} 段仍有检测器敏感模式，已执行第二轮定向改写。",
                                             "info",
                                         )
                                 except Exception as retry_exc:
@@ -1218,8 +1244,9 @@ def process_word(
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
-                        if is_suspicious_expansion(original_text, new_text):
-                            raise ValueError("疑似短标题或标签被扩写成正文，已拒绝写回。")
+                        reject_reason = suspicious_rewrite_reason(original_text, new_text)
+                        if reject_reason:
+                            raise ValueError(f"改写结果触发安全阀：{reject_reason}，已拒绝写回。")
                         rewrite_paragraph_text(task, new_text)
                         st.session_state.rewrite_report.append(
                             {
@@ -1234,6 +1261,9 @@ def process_word(
                                 "section": task["section_heading"],
                                 "section_type": task["section_type"],
                                 "write_mode": task.get("write_mode", ""),
+                                "rewrite_rounds": rewrite_rounds,
+                                "second_rewrite_applied": second_rewrite_applied,
+                                "reject_reason": reject_reason,
                                 "risk_tags": ", ".join(task["risk_profile"]["tags"]),
                                 "final_risk_tags": ", ".join(final_risk["tags"]),
                             }
@@ -1256,6 +1286,9 @@ def process_word(
                                 "section": task.get("section_heading", ""),
                                 "section_type": task.get("section_type", ""),
                                 "write_mode": task.get("write_mode", ""),
+                                "rewrite_rounds": rewrite_rounds,
+                                "second_rewrite_applied": second_rewrite_applied,
+                                "reject_reason": reject_reason,
                                 "risk_tags": ", ".join(task.get("risk_profile", {}).get("tags", [])),
                                 "final_risk_tags": "",
                             }
