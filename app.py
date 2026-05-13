@@ -748,7 +748,7 @@ def is_suspicious_expansion(original_text, new_text):
 AI_RISK_RULES = (
     {
         "tag": "generic_study_opening",
-        "pattern": r"\b(This study|The findings|The results|Existing research|Previous studies|It is important to note|To build upon)\b",
+        "pattern": r"\b(This study|The findings|The results|Existing research|Previous studies|It is important to note|To build upon|This research|This thesis)\b",
         "instruction": "Replace generic study/report openings with a direct claim tied to this paragraph's local content.",
     },
     {
@@ -758,13 +758,23 @@ AI_RISK_RULES = (
     },
     {
         "tag": "stock_interpretive_verbs",
-        "pattern": r"\b(shows|reveals|demonstrates|highlights|indicates|suggests|reflects|underscores|illustrates)\b",
-        "instruction": "Avoid repeatedly using stock interpretive verbs such as shows/reveals/suggests; state the relation more concretely.",
+        "pattern": r"\b(shows|reveals|demonstrates|highlights|indicates|suggests|reflects|underscores|illustrates|exhibits|presents|provides|offers)\b",
+        "instruction": "Avoid repeatedly using stock interpretive verbs such as shows/reveals/suggests/presents; state the relation more concretely.",
     },
     {
         "tag": "future_research_template",
-        "pattern": r"\b(future studies should|further research|future scholars|subsequent research|future work|longitudinal analysis would)\b",
+        "pattern": r"\b(future studies should|further research|future scholars|subsequent research|future work|longitudinal analysis would|future studies|future research)\b",
         "instruction": "Rewrite future-research language as specific unanswered questions or concrete next steps, not a formulaic closing paragraph.",
+    },
+    {
+        "tag": "results_data_template",
+        "pattern": r"\b(Tables?\s+\d|Figures?\s+\d|First,\s+regarding|percentage-point gap|frequency distribution|quantitative distribution|version exhibits|version shows|was adopted in|identified CLWs)\b",
+        "instruction": "Rewrite table/result reporting so it does not follow the fixed 'table presents + percentages + broad implication' pattern.",
+    },
+    {
+        "tag": "contribution_template",
+        "pattern": r"\b(contributions? that extend|replicable analytical pathway|methodological reference|theoretical and practical implications|offers several contributions|contribute to a deeper understanding)\b",
+        "instruction": "Rewrite contribution claims as restrained, specific takeaways; avoid broad contribution formulas.",
     },
     {
         "tag": "over_casual_naturalization",
@@ -820,7 +830,7 @@ def analyze_ai_risk(text, section_type="general"):
 
     has_data = bool(DATA_RE.search(text))
     if has_data and re.search(
-        r"\b(show|shows|reveal|reveals|suggest|suggests|indicate|indicates|reflect|reflects|account|accounts|represent|represents)\b",
+        r"\b(show|shows|reveal|reveals|suggest|suggests|indicate|indicates|reflect|reflects|account|accounts|represent|represents|present|presents|exhibit|exhibits|adopt|adopts|adopted)\b",
         text,
         re.IGNORECASE,
     ):
@@ -857,6 +867,67 @@ def build_risk_instruction(risk_profile):
 {bullets}
 
 Apply these repairs while preserving meaning, factual claims, citations, terminology, and the paragraph's role in the thesis."""
+
+
+HIGH_PRIORITY_RISK_TAGS = {
+    "formulaic_data_explanation",
+    "results_data_template",
+    "future_research_template",
+    "contribution_template",
+    "generic_study_opening",
+    "abstract_noun_density",
+}
+
+
+def task_temperature(base_temperature, risk_profile, section_type):
+    tags = set(risk_profile.get("tags", []))
+    boost = 0
+    if tags & HIGH_PRIORITY_RISK_TAGS:
+        boost += 0.06
+    if section_type in ("abstract", "results_discussion", "conclusion"):
+        boost += 0.05
+    if risk_profile.get("score", 0) >= 4:
+        boost += 0.04
+    return min(base_temperature + boost, 0.88)
+
+
+def should_force_risk_rewrite(original_text, new_text, before_risk, after_risk, section_type):
+    before_tags = set(before_risk.get("tags", []))
+    after_tags = set(after_risk.get("tags", []))
+    non_section_after_tags = {tag for tag in after_tags if not tag.startswith("section_")}
+    high_after = after_tags & HIGH_PRIORITY_RISK_TAGS
+    similarity = difflib.SequenceMatcher(None, original_text, new_text).ratio()
+
+    if similarity >= 0.92 and before_tags & HIGH_PRIORITY_RISK_TAGS:
+        return True
+    if high_after:
+        return True
+    if section_type in ("results_discussion", "conclusion") and non_section_after_tags:
+        return True
+    if before_risk.get("score", 0) >= 4 and after_risk.get("score", 0) >= 2:
+        return True
+    return False
+
+
+def build_force_rewrite_instruction(before_risk, after_risk, section_type):
+    combined = {
+        "instructions": list(before_risk.get("instructions", []))
+        + list(after_risk.get("instructions", []))
+    }
+    section_focus = {
+        "abstract": "For an abstract, remove formulaic purpose/result phrasing and keep the paragraph compact, direct, and information-dense.",
+        "results_discussion": "For a results/discussion paragraph, keep every figure accurate but rewrite the explanation around the specific comparison instead of using 'shows/reveals/suggests'.",
+        "conclusion": "For a conclusion paragraph, remove broad contribution and future-research formulas; state limits, implications, and next steps in specific terms.",
+    }.get(section_type, "Rewrite the paragraph more decisively while keeping the thesis-appropriate register.")
+
+    return (
+        build_risk_instruction(combined)
+        + "\n\nMandatory second-pass rewrite:\n"
+        + f"- {section_focus}\n"
+        + "- Do not preserve sentence order if it keeps the same formulaic rhythm.\n"
+        + "- Replace any remaining generic study openings, table-reporting formulas, and future-study stock phrases.\n"
+        + "- Keep citations, numbers, names, and technical terms exact."
+    )
 
 
 def process_word(
@@ -906,6 +977,16 @@ def process_word(
                         build_risk_instruction(task["risk_profile"]) if adaptive_risk_repair else ""
                     )
                     task["risk_instruction"] = risk_instruction
+                    current_temperature = (
+                        task_temperature(
+                            rewrite_temperature,
+                            task["risk_profile"],
+                            task["section_type"],
+                        )
+                        if adaptive_risk_repair
+                        else rewrite_temperature
+                    )
+                    task["rewrite_temperature"] = current_temperature
                     future = executor.submit(
                         call_deepseek,
                         task["plain_text"],
@@ -913,7 +994,7 @@ def process_word(
                         api_key,
                         model_name,
                         task["paragraph_index"] + 1,
-                        rewrite_temperature,
+                        current_temperature,
                         risk_instruction,
                     )
                     future_to_task[future] = task
@@ -939,7 +1020,7 @@ def process_word(
                                     api_key,
                                     model_name,
                                     para_no,
-                                    temperature=min(rewrite_temperature + 0.1, 0.85),
+                                    temperature=min(task.get("rewrite_temperature", rewrite_temperature) + 0.1, 0.9),
                                     extra_instruction=(
                                         task.get("risk_instruction", "")
                                         + "\n\n"
@@ -962,7 +1043,13 @@ def process_word(
                         elif adaptive_risk_repair:
                             before_risk = task["risk_profile"]
                             after_risk = analyze_ai_risk(new_text, task["section_type"])
-                            if before_risk["score"] >= 2 and after_risk["score"] >= before_risk["score"]:
+                            if should_force_risk_rewrite(
+                                original_text,
+                                new_text,
+                                before_risk,
+                                after_risk,
+                                task["section_type"],
+                            ):
                                 try:
                                     retry_response_text = call_deepseek(
                                         task["plain_text"],
@@ -970,9 +1057,16 @@ def process_word(
                                         api_key,
                                         model_name,
                                         para_no,
-                                        temperature=min(rewrite_temperature + 0.12, 0.88),
+                                        temperature=min(
+                                            task.get("rewrite_temperature", rewrite_temperature) + 0.14,
+                                            0.92,
+                                        ),
                                         extra_instruction=(
-                                            build_risk_instruction(after_risk)
+                                            build_force_rewrite_instruction(
+                                                before_risk,
+                                                after_risk,
+                                                task["section_type"],
+                                            )
                                             + "\n\nYour previous rewrite still retained too many detector-prone patterns. "
                                             "Rewrite again with less formulaic structure, fewer stock transitions, "
                                             "and more paragraph-specific phrasing."
