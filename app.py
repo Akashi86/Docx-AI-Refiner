@@ -968,12 +968,20 @@ def process_word(
     adaptive_risk_repair,
     log_container,
     progress_bar,
+    progress_status=None,
 ):
     st.session_state.logs = []
     st.session_state.rewrite_report = []
     st.session_state.tracked_file = None
 
+    def update_progress(value, message):
+        safe_value = min(max(float(value), 0.0), 1.0)
+        progress_bar.progress(safe_value)
+        if progress_status is not None:
+            progress_status.caption(message)
+
     try:
+        update_progress(0.01, "正在读取并解析 Word 文档...")
         add_log("正在读取并解析 Word 文档。")
         render_logs(log_container)
 
@@ -989,9 +997,11 @@ def process_word(
             if not tasks:
                 add_log("在设定范围内没有找到符合长度要求的正文段落。", "warn")
                 render_logs(log_container)
+                update_progress(0, "没有找到可处理段落。")
                 return None
 
             add_log(f"共找到 {len(tasks)} 个待处理段落，开始 {concurrency} 并发处理。", "info")
+            update_progress(0.06, f"已找到 {len(tasks)} 个待处理段落，正在提交给模型...")
             fallback_count = sum(
                 1 for task in tasks if task.get("write_mode") == "text_nodes_fallback"
             )
@@ -1167,9 +1177,14 @@ def process_word(
                         add_log(f"第 {para_no} 段处理失败，已保留原文：{exc}", "err")
 
                     completed_tasks += 1
-                    progress_bar.progress(completed_tasks / len(tasks))
+                    rewrite_progress = 0.06 + (completed_tasks / len(tasks)) * 0.84
+                    update_progress(
+                        rewrite_progress,
+                        f"AI 改写中：已完成 {completed_tasks}/{len(tasks)} 段。高风险段落可能会自动二次改写。",
+                    )
                     render_logs(log_container)
 
+            update_progress(0.92, "改写完成，正在打包润色版 Word 文档...")
             output_io = io.BytesIO()
             with zipfile.ZipFile(output_io, "w", zipfile.ZIP_DEFLATED) as out_zip:
                 for item in doc_zip.infolist():
@@ -1181,6 +1196,7 @@ def process_word(
 
         clean_docx = output_io.getvalue()
         add_log("润色版文档已打包完成。原段落、run 和样式结构没有被重建。", "success")
+        update_progress(0.96, "润色版已生成，正在尝试生成修订痕迹版...")
         try:
             tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
             st.session_state.tracked_file = tracked_docx
@@ -1188,11 +1204,13 @@ def process_word(
         except Exception as tracked_exc:
             add_log(f"修订版生成失败，已保留润色版下载：{tracked_exc}", "warn")
         render_logs(log_container)
+        update_progress(1.0, "处理完成，可以下载新文档。")
         return clean_docx
 
     except Exception as exc:
         add_log(f"处理流程发生异常：{exc}", "err")
         render_logs(log_container)
+        update_progress(0, "处理失败，请查看运行日志。")
         return None
 
 
@@ -1265,6 +1283,8 @@ with col_left:
 with col_right:
     st.subheader("运行日志")
     progress_bar = st.progress(0)
+    progress_status = st.empty()
+    progress_status.caption("等待任务开始。")
     log_container = st.empty()
     log_container.markdown(
         '<div class="log-box"><div class="log-entry">等待任务开始。</div></div>',
@@ -1280,6 +1300,7 @@ with col_right:
             st.session_state.processed_file = None
             st.session_state.tracked_file = None
             progress_bar.progress(0)
+            progress_status.caption("任务准备中...")
             result_bytes = process_word(
                 uploaded_file.getvalue(),
                 api_key,
@@ -1293,6 +1314,7 @@ with col_right:
                 adaptive_risk_repair,
                 log_container,
                 progress_bar,
+                progress_status,
             )
 
             if result_bytes:
