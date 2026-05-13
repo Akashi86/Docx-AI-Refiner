@@ -47,29 +47,62 @@ SKIP_STYLE_KEYWORDS = (
     "reference",
 )
 TITLE_LIKE_RE = re.compile(
-    r"^(abstract|chapter|section|table of contents|contents|references|bibliography|appendix)\b",
+    r"^(abstract|chapter|section|table of contents|contents|references|bibliography|appendix|acknowledgements?|摘要|关键词|關鍵詞|目录|目錄)\b",
+    re.IGNORECASE,
+)
+KEYWORD_LINE_RE = re.compile(r"^\s*(keywords?|关键词|關鍵詞)\s*[:：]", re.IGNORECASE)
+TITLE_CASE_WORD_RE = re.compile(r"^[A-Z][A-Za-z'’.-]*(?:\s+[A-Z][A-Za-z'’.-]*)*$")
+ACADEMIC_TITLE_HINT_RE = re.compile(
+    r"\b(A\s+Corpus-Based\s+Study|Case\s+Study|Translation\s+of|Research\s+on|Study\s+on)\b|"
+    r"(基于.+研究|以.+为例|翻译研究)",
+    re.IGNORECASE,
+)
+PROTECTED_FRONT_MATTER_RE = re.compile(
+    r"^(毕业论文原创性声明|论文作者签名|日期：|本人郑重声明|Acknowledgements?|I would like to express|"
+    r"In Partial Fulfillment|Under the Supervision|School of Foreign Studies|Nanjing University)",
+    re.IGNORECASE,
+)
+CASUAL_REWRITE_RE = re.compile(
+    r"\b(kicked off|packed with|zeroes in|let'?s cut|does not explain themselves|nipped at the heels|"
+    r"upended the field|hits its limits|doesn'?t|don'?t|isn'?t|aren'?t|won'?t|can'?t|the result\?)\b",
     re.IGNORECASE,
 )
 PROMPT_TEMPLATES = {
-    "降 AI 率（英文）": """Rewrite the paragraph as if a real undergraduate thesis writer revised their own draft, not as if an editor polished it. Keep the meaning, evidence, names, citations, terminology, and paragraph-level order, but rebuild the wording and sentence structure substantially.
+    "降 AI 率（英文）": """Rewrite the paragraph in a restrained undergraduate thesis style. Preserve the exact meaning, evidence, names, citations, terminology, numbers, and order of information. Make wording and sentence structure less formulaic, but do not turn the paragraph into magazine-like, conversational, or over-polished prose.
 
-Avoid the common AI-polished style: do not make every sentence equally smooth, balanced, or explanatory. Do not add broad summary phrases, generic transitions, inflated academic nouns, or neat three-part logic unless the source already needs them. Prefer concrete verbs and context-specific links. Let some sentences stay short and direct; let others carry detail where the source requires it. Keep the tone academically acceptable, but allow a modest amount of natural unevenness and authorial judgment.
+Important constraints:
+- Do not add examples, claims, conclusions, or explanatory details that are not already in the source.
+- Do not use contractions, rhetorical questions, punchy fragments, idioms, jokes, or casual phrases.
+- Avoid glossy AI-style balance, repeated "This study..." openings, stock transitions, and abstract noun stacks.
+- Keep the paragraph academically plain. Some sentences may stay simple and direct.
+- For titles, keyword lines, references, captions, and table/list labels, return the original unchanged.
+- Do not use Markdown formatting such as *italics* or **bold**.
 
-When rewriting, change more than synonyms: vary subjects, verbs, sentence openings, and clause order; compress filler; split or combine sentences only where it improves the paragraph. Return only the rewritten paragraph.""",
+Return only the rewritten paragraph.""",
     "降 AI 率（中文）": """请重写下面文本，使表达更自然、更少模板感和机器生成痕迹。避免使用“综上所述”“此外”“进一步而言”等套话式衔接，尽量改用更贴合上下文的过渡方式。调整句式开头和句长，多用具体动词，减少抽象名词堆叠。必要时拆分长句，并进行实质性改写，不要原样返回。""",
-    "学术润色（英文）": """Act as an experienced academic editor. Rewrite the text with clearer, more varied, and more natural scholarly prose. Replace formulaic transitions with context-specific links, vary sentence rhythm, and use more precise domain-aware wording. Keep the scholarly tone, but revise the wording substantially rather than polishing only a few words.""",
-    "深度自然化（英文）": """Rewrite the paragraph with a stronger human-draft style while keeping it suitable for a thesis or research report. Preserve the original meaning, facts, citations, and technical terms, but make the wording feel as though the author reconsidered the paragraph instead of running it through a polishing tool.
+    "学术润色（英文）": """Rewrite the text with clearer, plainer scholarly prose while preserving the original claim, evidence, citations, terminology, numbers, and order of information. Remove formulaic transitions and inflated academic phrasing, but do not make the paragraph conversational, punchy, metaphorical, or editorialized. Do not add new content. Return only the rewritten paragraph.""",
+    "深度自然化（英文）": """Rewrite the paragraph as a conservative thesis revision. Preserve the original meaning, facts, citations, numbers, and technical terms. Change sentence openings, clause order, and some wording where needed, but keep the register plain and academic.
 
-Use deeper sentence-level changes. Move clauses around, change the grammatical subject when it helps, remove empty setup phrases, replace abstract noun stacks with direct verbs, and avoid predictable transitions such as "moreover," "furthermore," "in addition," "overall," "it is important to note," and "this highlights." Do not over-improve the prose into a uniformly fluent AI style. Keep a natural academic rhythm with varied sentence lengths and occasional plain phrasing. Return only the rewritten paragraph.""",
-    "深度降 AI（英文强改写）": """Rewrite this paragraph aggressively enough that it reads like a human author's second draft, while preserving the same claim, evidence, citations, terminology, and order of information.
+Avoid both AI-polished prose and AI-naturalized prose:
+- no contractions, rhetorical questions, idioms, jokes, or punchy fragments;
+- no magazine-style verbs such as "kicked off," "packed with," "zeroes in," or "digs into";
+- no first-person unless the original paragraph already requires it;
+- no added examples or explanatory claims.
+- no Markdown formatting such as *italics* or **bold**.
+
+Return only the rewritten paragraph.""",
+    "深度降 AI（英文强改写）": """Rewrite this paragraph more decisively while preserving the same claim, evidence, citations, terminology, numbers, and order of information. The target is restrained undergraduate thesis prose, not polished editor prose and not casual humanization.
 
 Important style target:
 - Do not produce glossy, generic, perfectly balanced academic prose.
+- Do not produce conversational or magazine-like prose.
 - Avoid formulaic connectors, broad concluding language, and repeated sentence frames.
 - Remove filler and stock phrasing instead of replacing it with new stock phrasing.
 - Use concrete verbs and specific links to the local context.
-- Vary sentence length and syntax naturally; some sentences may be plain and compact.
-- If the source is wordy, compress it. If the source is thin, add only small clarifying detail that is already implied by the paragraph.
+- Vary sentence length and syntax modestly; some sentences may be plain and compact.
+- If the source is wordy, compress it. If the source is thin, do not add new detail.
+- Do not use contractions, rhetorical questions, idioms, jokes, punchy fragments, or first-person unless present in the source.
+- Do not use Markdown formatting such as *italics* or **bold**.
 
 Make substantial structural and lexical changes, not just synonym swaps. Return only the rewritten paragraph.""",
 }
@@ -618,7 +651,7 @@ def is_body_paragraph(paragraph, style_names=None):
     if any(keyword in style_label for keyword in SKIP_STYLE_KEYWORDS):
         return False
     compact_text = re.sub(r"\s+", " ", text).strip()
-    if TITLE_LIKE_RE.match(compact_text) and len(compact_text) <= 80:
+    if should_skip_protected_text(compact_text):
         return False
     words = word_count(compact_text)
     if words < 12:
@@ -626,6 +659,38 @@ def is_body_paragraph(paragraph, style_names=None):
     if words < 20 and not ends_with_sentence_punctuation(compact_text):
         return False
     return True
+
+
+def looks_like_academic_title(text):
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return False
+    if ends_with_sentence_punctuation(compact):
+        return False
+    words = compact.split()
+    if len(words) > 32:
+        return False
+    if ACADEMIC_TITLE_HINT_RE.search(compact):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", compact) and not re.search(r"[。！？.!?]", compact):
+        return bool(ACADEMIC_TITLE_HINT_RE.search(compact)) or (12 <= len(compact) <= 90)
+    titleish_words = sum(1 for word in words if word[:1].isupper())
+    return len(words) >= 8 and titleish_words / max(len(words), 1) >= 0.55
+
+
+def should_skip_protected_text(text):
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return True
+    if KEYWORD_LINE_RE.match(compact):
+        return True
+    if PROTECTED_FRONT_MATTER_RE.match(compact):
+        return True
+    if TITLE_LIKE_RE.match(compact) and len(compact) <= 120:
+        return True
+    if looks_like_academic_title(compact):
+        return True
+    return False
 
 
 def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index, min_chars):
@@ -643,6 +708,14 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
             current_heading = paragraph_plain_text(paragraph)
             current_section_type = detect_section_type(current_heading)
             continue
+        paragraph_text = paragraph_plain_text(paragraph)
+        compact_paragraph_text = re.sub(r"\s+", " ", paragraph_text).strip()
+        if re.match(r"^(abstract|摘\s*要)\b", compact_paragraph_text, re.IGNORECASE):
+            current_heading = compact_paragraph_text
+            current_section_type = "abstract"
+        elif re.match(r"^chapter\s+one\b", compact_paragraph_text, re.IGNORECASE):
+            current_heading = compact_paragraph_text
+            current_section_type = "introduction"
         if idx <= start_paragraph_index or idx >= end_index:
             continue
         if not is_body_paragraph(paragraph, style_names):
@@ -765,7 +838,20 @@ def rewrite_paragraph_text(task, new_text):
 def is_suspicious_expansion(original_text, new_text):
     original_words = word_count(original_text)
     new_words = word_count(new_text)
+    original_compact = re.sub(r"\s+", " ", original_text).strip()
+    new_compact = re.sub(r"\s+", " ", new_text).strip()
+    if should_skip_protected_text(original_compact) and original_compact != new_compact:
+        return True
+    if "*" not in original_compact and "*" in new_compact:
+        return True
+    if CASUAL_REWRITE_RE.search(new_compact):
+        return True
+    if not ends_with_sentence_punctuation(original_compact) and ends_with_sentence_punctuation(new_compact):
+        if new_words > max(20, int(original_words * 1.6)):
+            return True
     if original_words < 20 and new_words > max(30, int(original_words * 2.5)):
+        return True
+    if original_words >= 30 and new_words > int(original_words * 1.45):
         return True
     return False
 
@@ -803,13 +889,13 @@ AI_RISK_RULES = (
     },
     {
         "tag": "over_casual_naturalization",
-        "pattern": r"\b(real headaches|make or break|isn't a coincidence|sticks closer|leans into|zeroes in|on the ground)\b",
-        "instruction": "Avoid casual AI-naturalized phrasing; keep the wording plain, academic, and author-like.",
+        "pattern": r"\b(real headaches|make or break|isn't a coincidence|sticks closer|leans into|zeroes in|on the ground|kicked off|packed with|digs into|let'?s cut|upended the field|hits its limits|nipped at the heels)\b",
+        "instruction": "Avoid casual AI-naturalized phrasing, idioms, and punchy editorial language; keep the wording plain and thesis-appropriate.",
     },
     {
         "tag": "first_person_method",
-        "pattern": r"\b(I|we|my|our)\b.*\b(gathered|used|built|coded|classified|aligned|checked|analysis|method|corpus|data)\b",
-        "instruction": "Keep methodology procedural and thesis-appropriate; avoid unnecessary first-person narration.",
+        "pattern": r"\b(I|we|my|our)\b",
+        "instruction": "Avoid first-person narration unless the original paragraph already used it; keep methodology procedural and thesis-appropriate.",
     },
 )
 
