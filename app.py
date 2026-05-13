@@ -1235,6 +1235,55 @@ def build_force_rewrite_instruction(before_risk, after_risk, section_type):
     )
 
 
+def apply_repeat_ai_reduction(
+    text,
+    prompt,
+    api_key,
+    model_name,
+    para_no,
+    base_temperature,
+    existing_instruction,
+    repeat_rewrite_rounds,
+    current_rounds,
+):
+    new_text = text
+    rounds = current_rounds or 1
+    retry_error = ""
+    target_rounds = max(1, int(repeat_rewrite_rounds or 1))
+    if target_rounds <= 1:
+        return new_text, rounds, False, retry_error
+
+    applied = False
+    for repeat_index in range(2, target_rounds + 1):
+        try:
+            repeat_response = call_deepseek(
+                new_text,
+                prompt,
+                api_key,
+                model_name,
+                para_no,
+                temperature=min(base_temperature + 0.06 * (repeat_index - 1), 0.92),
+                extra_instruction=(
+                    (existing_instruction or "")
+                    + "\n\nRepeat AIGC-reduction pass:\n"
+                    "- Use the current rewritten paragraph as the input, not the original paragraph.\n"
+                    "- Keep all claims, citations, names, numbers, and technical terms exact.\n"
+                    "- Change sentence rhythm and local phrasing again, but do not make the paragraph casual, promotional, or longer than necessary.\n"
+                    "- Avoid restoring formulaic thesis phrases from earlier versions."
+                ),
+                max_retries=2,
+            )
+            repeat_text = repeat_response.strip()
+            if repeat_text and repeat_text != new_text:
+                new_text = repeat_text
+                rounds += 1
+                applied = True
+        except Exception as exc:
+            retry_error = str(exc)
+            break
+    return new_text, rounds, applied, retry_error
+
+
 def process_word(
     file_bytes,
     api_key,
@@ -1246,6 +1295,8 @@ def process_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
+    repeat_rewrite_rounds,
+    generate_tracked_file,
     log_container,
     progress_bar,
     progress_status=None,
@@ -1418,6 +1469,25 @@ def process_word(
                                         f"Paragraph {para_no}: second risk-repair rewrite failed; keeping the first result: {retry_exc}",
                                         "warn",
                                     )
+                        repeated_text, rewrite_rounds, repeat_applied, repeat_error = apply_repeat_ai_reduction(
+                            new_text,
+                            prompt,
+                            api_key,
+                            model_name,
+                            para_no,
+                            task.get("rewrite_temperature", rewrite_temperature),
+                            task.get("risk_instruction", ""),
+                            repeat_rewrite_rounds,
+                            rewrite_rounds,
+                        )
+                        if repeat_error:
+                            retry_error = repeat_error
+                            add_log(f"第 {para_no} 段重复降 AI 轮次失败，保留上一轮结果：{repeat_error}", "warn")
+                        if repeat_applied:
+                            new_text = repeated_text
+                            second_rewrite_applied = True
+                            add_log(f"第 {para_no} 段已完成重复降 AI 改写，总轮数：{rewrite_rounds}。", "info")
+
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
@@ -1492,13 +1562,16 @@ def process_word(
 
         clean_docx = output_io.getvalue()
         add_log("润色版文档已打包完成。原段落、run 和样式结构没有被重建。", "success")
-        update_progress(0.96, "润色版已生成，正在尝试生成修订痕迹版...")
-        try:
-            tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
-            st.session_state.tracked_file = tracked_docx
-            add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
-        except Exception as tracked_exc:
-            add_log(f"修订版生成失败，已保留润色版下载：{tracked_exc}", "warn")
+        if generate_tracked_file:
+            update_progress(0.96, "润色版已生成，正在生成修订痕迹版...")
+            try:
+                tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
+                st.session_state.tracked_file = tracked_docx
+                add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
+            except Exception as tracked_exc:
+                add_log(f"修订版生成失败，已保留润色版下载：{tracked_exc}", "warn")
+        else:
+            add_log("已跳过修订痕迹版生成，处理速度更快。", "info")
         render_logs(log_container)
         update_progress(1.0, "处理完成，可以下载新文档。")
         return clean_docx
@@ -1522,6 +1595,8 @@ def process_report_repair_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
+    repeat_rewrite_rounds,
+    generate_tracked_file,
     log_container,
     progress_bar,
     progress_status=None,
@@ -1662,6 +1737,25 @@ def process_report_repair_word(
                                 retry_error = str(retry_exc)
                                 add_log(f"第 {para_no} 段返修二次改写失败，保留第一轮结果：{retry_exc}", "warn")
 
+                        repeated_text, rewrite_rounds, repeat_applied, repeat_error = apply_repeat_ai_reduction(
+                            new_text,
+                            prompt,
+                            api_key,
+                            model_name,
+                            para_no,
+                            task.get("rewrite_temperature", rewrite_temperature),
+                            task.get("risk_instruction", ""),
+                            repeat_rewrite_rounds,
+                            rewrite_rounds,
+                        )
+                        if repeat_error:
+                            retry_error = repeat_error
+                            add_log(f"第 {para_no} 段重复降 AI 轮次失败，保留上一轮结果：{repeat_error}", "warn")
+                        if repeat_applied:
+                            new_text = repeated_text
+                            second_rewrite_applied = True
+                            add_log(f"第 {para_no} 段已完成重复降 AI 改写，总轮数：{rewrite_rounds}。", "info")
+
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
@@ -1737,18 +1831,21 @@ def process_report_repair_word(
 
         clean_docx = output_io.getvalue()
         add_log("检测报告返修版文档已打包完成。", "success")
-        tracked_base = tracked_base_bytes or file_bytes
-        tracked_label = "原始第一版" if tracked_base_bytes else "当前上传文档"
-        update_progress(0.96, f"返修版已生成，正在尝试生成相对{tracked_label}的修订痕迹版...")
-        try:
-            tracked_docx, tracked_count = generate_tracked_changes_docx(tracked_base, clean_docx)
-            st.session_state.tracked_file = tracked_docx
-            add_log(
-                f"修订版文档已生成，比较基准：{tracked_label}，共写入 {tracked_count} 个段落级修订。",
-                "success",
-            )
-        except Exception as tracked_exc:
-            add_log(f"修订版生成失败，已保留返修版下载：{tracked_exc}", "warn")
+        if generate_tracked_file:
+            tracked_base = tracked_base_bytes or file_bytes
+            tracked_label = "原始第一版" if tracked_base_bytes else "当前上传文档"
+            update_progress(0.96, f"返修版已生成，正在生成相对{tracked_label}的修订痕迹版...")
+            try:
+                tracked_docx, tracked_count = generate_tracked_changes_docx(tracked_base, clean_docx)
+                st.session_state.tracked_file = tracked_docx
+                add_log(
+                    f"修订版文档已生成，比较基准：{tracked_label}，共写入 {tracked_count} 个段落级修订。",
+                    "success",
+                )
+            except Exception as tracked_exc:
+                add_log(f"修订版生成失败，已保留返修版下载：{tracked_exc}", "warn")
+        else:
+            add_log("已跳过修订痕迹版生成，处理速度更快。", "info")
         render_logs(log_container)
         update_progress(1.0, "检测报告返修完成，可以下载新文档。")
         return clean_docx
@@ -1786,6 +1883,11 @@ with col_left:
         horizontal=True,
         help="定点返修会读取 AIGC 检测报告，只改报告命中的疑似 AI 段落。",
     )
+    generate_tracked_file = st.checkbox(
+        "生成修订痕迹版（较慢）",
+        value=False,
+        help="关闭后只生成润色/返修后的 Word，速度更快；需要对比修改痕迹时再开启。",
+    )
     aigc_report_file = None
     original_base_file = None
     if process_mode == "检测报告定点返修":
@@ -1794,11 +1896,12 @@ with col_left:
             type=["html", "htm", "pdf"],
             help="优先上传检测平台导出的 HTML 统计报告；PDF 也可尝试解析。",
         )
-        original_base_file = st.file_uploader(
-            "可选：上传第一版/原始 Word，用于生成相对原文的修订版",
-            type=["docx"],
-            help="不上传则修订版默认比较“当前待返修 Word -> 返修版”。上传后会比较“第一版/原文 -> 最终返修版”。",
-        )
+        if generate_tracked_file:
+            original_base_file = st.file_uploader(
+                "可选：上传第一版/原始 Word，用于生成相对原文的修订版",
+                type=["docx"],
+                help="不上传则修订版默认比较“当前待返修 Word -> 返修版”。上传后会比较“第一版/原文 -> 最终返修版”。",
+            )
 
     headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
     heading_labels = [heading["label"] for heading in headings]
@@ -1843,6 +1946,13 @@ with col_left:
         value=True,
         help="自动识别摘要、方法、结果、结论等段落中的模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
     )
+    repeat_rewrite_rounds = st.slider(
+        "重复降低 AI 率轮数",
+        min_value=1,
+        max_value=3,
+        value=1,
+        help="1 表示只做常规改写；2/3 会拿上一轮结果继续改写，耗时和 API 调用会相应增加。",
+    )
 
 with col_right:
     st.subheader("运行日志")
@@ -1882,6 +1992,8 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
+                    repeat_rewrite_rounds,
+                    generate_tracked_file,
                     log_container,
                     progress_bar,
                     progress_status,
@@ -1899,6 +2011,8 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
+                    repeat_rewrite_rounds,
+                    generate_tracked_file,
                     log_container,
                     progress_bar,
                     progress_status,
