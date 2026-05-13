@@ -667,6 +667,55 @@ def call_deepseek(
     raise RuntimeError(f"段落 {task_id} 调用失败，已重试 {max_retries} 次：{last_error}")
 
 
+def call_deepseek_direct(
+    text,
+    system_prompt,
+    api_key,
+    model_name,
+    task_id,
+    temperature=0.4,
+    max_retries=3,
+):
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        "temperature": temperature,
+    }
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            if response.status_code == 401:
+                raise RuntimeError("API Key 错误或无效。")
+            if response.status_code == 402:
+                raise RuntimeError("账号余额不足。")
+            if response.status_code in (400, 404):
+                raise RuntimeError(f"模型 {model_name} 不可用或请求格式错误。")
+            if response.status_code == 429 or response.status_code >= 500:
+                raise requests.RequestException(
+                    f"DeepSeek 暂时不可用或限流，HTTP {response.status_code}: {response.text[:300]}"
+                )
+            response.raise_for_status()
+
+            data = response.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt == max_retries:
+                break
+            time.sleep(min(attempt * 4, 20))
+
+    raise RuntimeError(f"段落 {task_id} 调用失败，已重试 {max_retries} 次：{last_error}")
+
+
 def direct_text_runs(paragraph):
     return [child for child in list(paragraph) if child.tag == f"{W_NS}r" and is_pure_text_run(child)]
 
@@ -1023,14 +1072,14 @@ def rewrite_paragraph_text(task, new_text):
         paragraph.insert(first_index + offset, run)
 
 
-def suspicious_rewrite_reason(original_text, new_text):
+def suspicious_rewrite_reason(original_text, new_text, enforce_format_safety=True):
     original_words = word_count(original_text)
     new_words = word_count(new_text)
     original_compact = re.sub(r"\s+", " ", original_text).strip()
     new_compact = re.sub(r"\s+", " ", new_text).strip()
     if should_skip_protected_text(original_compact) and original_compact != new_compact:
         return "protected_text_changed"
-    if "*" not in original_compact and "*" in new_compact:
+    if enforce_format_safety and "*" not in original_compact and "*" in new_compact:
         return "markdown_formatting_added"
     if CASUAL_REWRITE_RE.search(new_compact):
         return "casual_rewrite_phrase"
@@ -1235,53 +1284,45 @@ def build_force_rewrite_instruction(before_risk, after_risk, section_type):
     )
 
 
-def apply_repeat_ai_reduction(
+def apply_back_translation_reduction(
     text,
-    prompt,
     api_key,
     model_name,
     para_no,
     base_temperature,
-    existing_instruction,
-    repeat_rewrite_rounds,
-    current_rounds,
 ):
-    new_text = text
-    rounds = current_rounds or 1
-    retry_error = ""
-    target_rounds = max(1, int(repeat_rewrite_rounds or 1))
-    if target_rounds <= 1:
-        return new_text, rounds, False, retry_error
-
-    applied = False
-    for repeat_index in range(2, target_rounds + 1):
-        try:
-            repeat_response = call_deepseek(
-                new_text,
-                prompt,
-                api_key,
-                model_name,
-                para_no,
-                temperature=min(base_temperature + 0.06 * (repeat_index - 1), 0.92),
-                extra_instruction=(
-                    (existing_instruction or "")
-                    + "\n\nRepeat AIGC-reduction pass:\n"
-                    "- Use the current rewritten paragraph as the input, not the original paragraph.\n"
-                    "- Keep all claims, citations, names, numbers, and technical terms exact.\n"
-                    "- Change sentence rhythm and local phrasing again, but do not make the paragraph casual, promotional, or longer than necessary.\n"
-                    "- Avoid restoring formulaic thesis phrases from earlier versions."
-                ),
-                max_retries=2,
-            )
-            repeat_text = repeat_response.strip()
-            if repeat_text and repeat_text != new_text:
-                new_text = repeat_text
-                rounds += 1
-                applied = True
-        except Exception as exc:
-            retry_error = str(exc)
-            break
-    return new_text, rounds, applied, retry_error
+    chinese_prompt = """Translate the paragraph into Chinese as an intermediate draft.
+Strict rules:
+1. Return only the Chinese translation, with no notes or Markdown.
+2. Preserve all citations, numbers, names, book titles, theory names, corpus terms, and technical terms as accurately as possible.
+3. Do not add, delete, or reinterpret claims.
+4. Keep the paragraph as one paragraph."""
+    english_prompt = """Translate the Chinese intermediate draft back into English for an undergraduate thesis.
+Strict rules:
+1. Return only the final English paragraph, with no notes or Markdown.
+2. Preserve all citations, numbers, names, book titles, theory names, corpus terms, and technical terms exactly where possible.
+3. Do not add new facts, examples, references, data, or conclusions.
+4. Keep the tone plain, academic, and thesis-appropriate; avoid casual wording and template-like AI phrasing.
+5. Keep the paragraph as one paragraph."""
+    chinese_text = call_deepseek_direct(
+        text,
+        chinese_prompt,
+        api_key,
+        model_name,
+        f"{para_no}-zh",
+        temperature=min(base_temperature, 0.75),
+        max_retries=2,
+    )
+    english_text = call_deepseek_direct(
+        chinese_text,
+        english_prompt,
+        api_key,
+        model_name,
+        f"{para_no}-en",
+        temperature=min(base_temperature + 0.04, 0.82),
+        max_retries=2,
+    )
+    return english_text.strip()
 
 
 def process_word(
@@ -1295,7 +1336,8 @@ def process_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
-    repeat_rewrite_rounds,
+    enable_back_translation,
+    enforce_format_safety,
     generate_tracked_file,
     log_container,
     progress_bar,
@@ -1469,29 +1511,32 @@ def process_word(
                                         f"Paragraph {para_no}: second risk-repair rewrite failed; keeping the first result: {retry_exc}",
                                         "warn",
                                     )
-                        repeated_text, rewrite_rounds, repeat_applied, repeat_error = apply_repeat_ai_reduction(
-                            new_text,
-                            prompt,
-                            api_key,
-                            model_name,
-                            para_no,
-                            task.get("rewrite_temperature", rewrite_temperature),
-                            task.get("risk_instruction", ""),
-                            repeat_rewrite_rounds,
-                            rewrite_rounds,
-                        )
-                        if repeat_error:
-                            retry_error = repeat_error
-                            add_log(f"第 {para_no} 段重复降 AI 轮次失败，保留上一轮结果：{repeat_error}", "warn")
-                        if repeat_applied:
-                            new_text = repeated_text
-                            second_rewrite_applied = True
-                            add_log(f"第 {para_no} 段已完成重复降 AI 改写，总轮数：{rewrite_rounds}。", "info")
+                        if enable_back_translation:
+                            try:
+                                back_translated_text = apply_back_translation_reduction(
+                                    new_text,
+                                    api_key,
+                                    model_name,
+                                    para_no,
+                                    task.get("rewrite_temperature", rewrite_temperature),
+                                )
+                                if back_translated_text and back_translated_text != new_text:
+                                    new_text = back_translated_text
+                                    rewrite_rounds += 2
+                                    second_rewrite_applied = True
+                                    add_log(f"第 {para_no} 段已完成中文中转回译。", "info")
+                            except Exception as back_translate_exc:
+                                retry_error = str(back_translate_exc)
+                                add_log(f"第 {para_no} 段中文中转回译失败，保留上一轮结果：{back_translate_exc}", "warn")
 
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
-                        reject_reason = suspicious_rewrite_reason(original_text, new_text)
+                        reject_reason = suspicious_rewrite_reason(
+                            original_text,
+                            new_text,
+                            enforce_format_safety=enforce_format_safety,
+                        )
                         if reject_reason:
                             raise ValueError(f"改写结果触发安全阀：{reject_reason}，已拒绝写回。")
                         rewrite_paragraph_text(task, new_text)
@@ -1595,7 +1640,8 @@ def process_report_repair_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
-    repeat_rewrite_rounds,
+    enable_back_translation,
+    enforce_format_safety,
     generate_tracked_file,
     log_container,
     progress_bar,
@@ -1737,29 +1783,32 @@ def process_report_repair_word(
                                 retry_error = str(retry_exc)
                                 add_log(f"第 {para_no} 段返修二次改写失败，保留第一轮结果：{retry_exc}", "warn")
 
-                        repeated_text, rewrite_rounds, repeat_applied, repeat_error = apply_repeat_ai_reduction(
-                            new_text,
-                            prompt,
-                            api_key,
-                            model_name,
-                            para_no,
-                            task.get("rewrite_temperature", rewrite_temperature),
-                            task.get("risk_instruction", ""),
-                            repeat_rewrite_rounds,
-                            rewrite_rounds,
-                        )
-                        if repeat_error:
-                            retry_error = repeat_error
-                            add_log(f"第 {para_no} 段重复降 AI 轮次失败，保留上一轮结果：{repeat_error}", "warn")
-                        if repeat_applied:
-                            new_text = repeated_text
-                            second_rewrite_applied = True
-                            add_log(f"第 {para_no} 段已完成重复降 AI 改写，总轮数：{rewrite_rounds}。", "info")
+                        if enable_back_translation:
+                            try:
+                                back_translated_text = apply_back_translation_reduction(
+                                    new_text,
+                                    api_key,
+                                    model_name,
+                                    para_no,
+                                    task.get("rewrite_temperature", rewrite_temperature),
+                                )
+                                if back_translated_text and back_translated_text != new_text:
+                                    new_text = back_translated_text
+                                    rewrite_rounds += 2
+                                    second_rewrite_applied = True
+                                    add_log(f"第 {para_no} 段已完成中文中转回译。", "info")
+                            except Exception as back_translate_exc:
+                                retry_error = str(back_translate_exc)
+                                add_log(f"第 {para_no} 段中文中转回译失败，保留上一轮结果：{back_translate_exc}", "warn")
 
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
-                        reject_reason = suspicious_rewrite_reason(original_text, new_text)
+                        reject_reason = suspicious_rewrite_reason(
+                            original_text,
+                            new_text,
+                            enforce_format_safety=enforce_format_safety,
+                        )
                         if reject_reason:
                             raise ValueError(f"改写结果触发安全阀：{reject_reason}，已拒绝写回。")
                         rewrite_paragraph_text(task, new_text)
@@ -1946,12 +1995,15 @@ with col_left:
         value=True,
         help="自动识别摘要、方法、结果、结论等段落中的模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
     )
-    repeat_rewrite_rounds = st.slider(
-        "重复降低 AI 率轮数",
-        min_value=1,
-        max_value=3,
-        value=1,
-        help="1 表示只做常规改写；2/3 会拿上一轮结果继续改写，耗时和 API 调用会相应增加。",
+    enable_back_translation = st.checkbox(
+        "启用中文中转回译",
+        value=False,
+        help="每段先改写，再翻译成中文，最后翻译回英文。会明显增加耗时和 API 调用次数。",
+    )
+    enforce_format_safety = st.checkbox(
+        "启用格式安全阀",
+        value=True,
+        help="开启时，如果模型在原文没有星号的段落里新增 Markdown 星号，会拒绝写回；关闭后仍保留标题保护、过长扩写等内容安全阀。",
     )
 
 with col_right:
@@ -1992,7 +2044,8 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
-                    repeat_rewrite_rounds,
+                    enable_back_translation,
+                    enforce_format_safety,
                     generate_tracked_file,
                     log_container,
                     progress_bar,
@@ -2011,7 +2064,8 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
-                    repeat_rewrite_rounds,
+                    enable_back_translation,
+                    enforce_format_safety,
                     generate_tracked_file,
                     log_container,
                     progress_bar,
