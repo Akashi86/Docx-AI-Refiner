@@ -10,6 +10,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 
 import requests
@@ -194,6 +195,8 @@ if "tracked_file" not in st.session_state:
     st.session_state.tracked_file = None
 if "rewrite_report" not in st.session_state:
     st.session_state.rewrite_report = []
+if "output_prefix" not in st.session_state:
+    st.session_state.output_prefix = "润色版"
 
 
 def add_log(message, kind="normal"):
@@ -335,6 +338,9 @@ def report_to_csv(report):
             "rewrite_rounds",
             "second_rewrite_applied",
             "reject_reason",
+            "repair_mode",
+            "match_score",
+            "matched_fragments",
             "risk_tags",
             "final_risk_tags",
             "original_text",
@@ -355,6 +361,9 @@ def report_to_csv(report):
                 "rewrite_rounds": item.get("rewrite_rounds", ""),
                 "second_rewrite_applied": item.get("second_rewrite_applied", ""),
                 "reject_reason": item.get("reject_reason", ""),
+                "repair_mode": item.get("repair_mode", ""),
+                "match_score": item.get("match_score", ""),
+                "matched_fragments": item.get("matched_fragments", ""),
                 "risk_tags": item.get("risk_tags", ""),
                 "final_risk_tags": item.get("final_risk_tags", ""),
                 "original_text": item.get("original_text", ""),
@@ -438,6 +447,160 @@ def make_system_prompt(user_prompt, extra_instruction=""):
 5. 不要把文本改成过度工整、过度平滑、处处对称的 AI 润色腔。宁可保留适度自然的不均匀节奏，也不要生成模板化套话。
 6. 如果原文有具体上下文，优先用上下文内的衔接方式，不要使用空泛连接词或泛泛总结句。
 """
+
+
+class SuspiciousSpanParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.depth = 0
+        self.current = []
+        self.fragments = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        class_value = attrs_dict.get("class", "")
+        if tag in ("a", "span", "div") and re.search(r"\b(cl[123]|hide_3)\b", class_value):
+            self.depth += 1
+        elif self.depth:
+            self.depth += 1
+
+    def handle_endtag(self, tag):
+        if not self.depth:
+            return
+        self.depth -= 1
+        if self.depth == 0:
+            text = normalize_visible_text("".join(self.current))
+            if text:
+                self.fragments.append(text)
+            self.current = []
+
+    def handle_data(self, data):
+        if self.depth:
+            self.current.append(data)
+
+
+def normalize_visible_text(text):
+    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+
+
+def normalize_for_match(text):
+    text = html.unescape(text or "").lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
+    return text
+
+
+def clean_html_fragment(raw_html):
+    text = re.sub(r"<br\s*/?>", " ", raw_html, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return normalize_visible_text(text)
+
+
+def dedupe_fragments(fragments, min_chars=28):
+    seen = set()
+    results = []
+    for fragment in fragments:
+        clean = normalize_visible_text(fragment)
+        if len(clean) < min_chars:
+            continue
+        key = normalize_for_match(clean)
+        if len(key) < min_chars or key in seen:
+            continue
+        seen.add(key)
+        results.append(clean)
+    return results
+
+
+def extract_report_fragments_from_html(report_bytes):
+    text = report_bytes.decode("utf-8", errors="ignore")
+    fragments = []
+
+    parser = SuspiciousSpanParser()
+    try:
+        parser.feed(text)
+        fragments.extend(parser.fragments)
+    except Exception:
+        pass
+
+    for match in re.finditer(r"<span[^>]*class=['\"]hide_3['\"][^>]*>(.*?)</span>", text, re.I | re.S):
+        fragments.append(clean_html_fragment(match.group(1)))
+    for match in re.finditer(r"<a[^>]*class=['\"][^'\"]*\bcl[123]\b[^'\"]*['\"][^>]*>(.*?)</a>", text, re.I | re.S):
+        fragments.append(clean_html_fragment(match.group(1)))
+
+    return dedupe_fragments(fragments)
+
+
+def extract_report_fragments_from_pdf(report_bytes):
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        raise RuntimeError("PDF 报告解析需要 pypdf 依赖，请先安装 requirements.txt。") from exc
+
+    reader = PdfReader(io.BytesIO(report_bytes))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    candidates = []
+    for line in text.splitlines():
+        clean = normalize_visible_text(line)
+        if len(clean) >= 40:
+            candidates.append(clean)
+    return dedupe_fragments(candidates)
+
+
+def extract_report_fragments(report_bytes, report_name):
+    lower_name = (report_name or "").lower()
+    if lower_name.endswith(".html") or lower_name.endswith(".htm"):
+        return extract_report_fragments_from_html(report_bytes)
+    if lower_name.endswith(".pdf"):
+        return extract_report_fragments_from_pdf(report_bytes)
+    raise RuntimeError("检测报告只支持 HTML、HTM 或 PDF。")
+
+
+def match_report_fragments_to_tasks(fragments, tasks, max_tasks=None):
+    matches_by_task = {}
+    normalized_tasks = [(task, normalize_for_match(task["plain_text"])) for task in tasks]
+
+    for fragment in fragments:
+        norm_fragment = normalize_for_match(fragment)
+        if len(norm_fragment) < 28:
+            continue
+        best_task = None
+        best_score = 0.0
+        for task, norm_text in normalized_tasks:
+            if not norm_text:
+                continue
+            score = 0.0
+            if norm_fragment in norm_text:
+                score = min(1.0, len(norm_fragment) / max(len(norm_text), 1) + 0.35)
+            elif norm_text in norm_fragment:
+                score = min(0.95, len(norm_text) / max(len(norm_fragment), 1))
+            elif len(norm_fragment) >= 80:
+                score = difflib.SequenceMatcher(None, norm_fragment, norm_text).ratio()
+            if score > best_score:
+                best_score = score
+                best_task = task
+
+        if best_task is None or best_score < 0.58:
+            continue
+        key = best_task["paragraph_index"]
+        entry = matches_by_task.setdefault(
+            key,
+            {
+                "task": best_task,
+                "fragments": [],
+                "score": 0.0,
+            },
+        )
+        entry["score"] = max(entry["score"], best_score)
+        if len(entry["fragments"]) < 5:
+            entry["fragments"].append(fragment)
+
+    matches = sorted(
+        matches_by_task.values(),
+        key=lambda item: (item["task"]["page"], item["task"]["paragraph_index"]),
+    )
+    if max_tasks:
+        matches = matches[:max_tasks]
+    return matches
 
 
 def call_deepseek(
@@ -1333,6 +1496,249 @@ def process_word(
         return None
 
 
+def process_report_repair_word(
+    file_bytes,
+    report_bytes,
+    report_name,
+    api_key,
+    model_name,
+    concurrency,
+    min_chars,
+    prompt,
+    rewrite_temperature,
+    adaptive_risk_repair,
+    log_container,
+    progress_bar,
+    progress_status=None,
+):
+    st.session_state.logs = []
+    st.session_state.rewrite_report = []
+    st.session_state.tracked_file = None
+
+    def update_progress(value, message):
+        safe_value = min(max(float(value), 0.0), 1.0)
+        progress_bar.progress(safe_value)
+        if progress_status is not None:
+            progress_status.caption(message)
+
+    try:
+        update_progress(0.01, "正在读取检测报告...")
+        fragments = extract_report_fragments(report_bytes, report_name)
+        add_log(f"检测报告中提取到 {len(fragments)} 个疑似片段。", "info")
+        render_logs(log_container)
+        if not fragments:
+            add_log("未能从检测报告中提取疑似 AI 片段，请优先上传 HTML 统计报告。", "warn")
+            update_progress(0, "未提取到疑似片段。")
+            return None
+
+        update_progress(0.05, "正在解析 Word 并匹配疑似片段...")
+        input_buffer = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(input_buffer, "r") as doc_zip:
+            xml_content = doc_zip.read("word/document.xml")
+            root = ET.fromstring(xml_content)
+            style_names = read_style_names(doc_zip)
+            merged_count = merge_adjacent_text_runs(root)
+            tasks = collect_tasks(root, style_names, -1, None, min_chars)
+            matches = match_report_fragments_to_tasks(fragments, tasks)
+            if not matches:
+                add_log("疑似片段没有匹配到可改写的 Word 正文段落。", "warn")
+                update_progress(0, "未匹配到可返修段落。")
+                render_logs(log_container)
+                return None
+
+            add_log(
+                f"已合并 {merged_count} 个相邻 run。检测报告命中 {len(matches)} 个 Word 段落，开始定点返修。",
+                "info",
+            )
+            render_logs(log_container)
+            update_progress(0.10, f"已匹配 {len(matches)} 个高风险段落，正在提交给模型...")
+
+            completed_tasks = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                future_to_match = {}
+                for match in matches:
+                    task = match["task"]
+                    matched_text = "\n".join(f"- {frag[:500]}" for frag in match["fragments"][:3])
+                    report_instruction = (
+                        "This paragraph was matched from an AIGC detector report and needs targeted repair.\n"
+                        "Detector-flagged fragment(s):\n"
+                        f"{matched_text}\n\n"
+                        "Revise the whole paragraph, but focus on removing the detector-prone rhythm in those fragments. "
+                        "Keep citations, names, numbers, terminology, and claims exact. Do not add new content."
+                    )
+                    risk_instruction = (
+                        build_risk_instruction(task["risk_profile"]) if adaptive_risk_repair else ""
+                    )
+                    task["risk_instruction"] = "\n\n".join(
+                        item for item in (report_instruction, risk_instruction) if item
+                    )
+                    current_temperature = (
+                        task_temperature(
+                            rewrite_temperature,
+                            task["risk_profile"],
+                            task["section_type"],
+                        )
+                        if adaptive_risk_repair
+                        else rewrite_temperature
+                    )
+                    task["rewrite_temperature"] = min(current_temperature + 0.04, 0.9)
+                    future = executor.submit(
+                        call_deepseek,
+                        task["plain_text"],
+                        prompt,
+                        api_key,
+                        model_name,
+                        task["paragraph_index"] + 1,
+                        task["rewrite_temperature"],
+                        task["risk_instruction"],
+                    )
+                    future_to_match[future] = match
+                    add_log(
+                        f"第 {task['paragraph_index'] + 1} 段命中检测报告，已发送给模型。",
+                        "send",
+                    )
+
+                render_logs(log_container)
+                for future in concurrent.futures.as_completed(future_to_match):
+                    match = future_to_match[future]
+                    task = match["task"]
+                    para_no = task["paragraph_index"] + 1
+                    rewrite_rounds = ""
+                    second_rewrite_applied = False
+                    reject_reason = ""
+                    try:
+                        response_text = future.result()
+                        original_text = task["plain_text"]
+                        new_text = response_text.strip()
+                        retry_error = ""
+                        rewrite_rounds = 1
+
+                        before_risk = task["risk_profile"]
+                        after_risk = analyze_ai_risk(new_text, task["section_type"])
+                        if adaptive_risk_repair and should_force_risk_rewrite(
+                            original_text,
+                            new_text,
+                            before_risk,
+                            after_risk,
+                            task["section_type"],
+                        ):
+                            try:
+                                retry_response_text = call_deepseek(
+                                    task["plain_text"],
+                                    prompt,
+                                    api_key,
+                                    model_name,
+                                    para_no,
+                                    temperature=min(task.get("rewrite_temperature", rewrite_temperature) + 0.12, 0.92),
+                                    extra_instruction=(
+                                        task.get("risk_instruction", "")
+                                        + "\n\nMandatory report-repair second pass: the first rewrite still looks detector-prone. "
+                                        "Make a more substantial but restrained thesis-style revision. Keep all factual content exact."
+                                    ),
+                                    max_retries=2,
+                                )
+                                retry_new_text = retry_response_text.strip()
+                                if retry_new_text and retry_new_text != original_text:
+                                    new_text = retry_new_text
+                                    rewrite_rounds += 1
+                                    second_rewrite_applied = True
+                                    add_log(f"第 {para_no} 段返修后仍有风险，已执行第二轮定向改写。", "info")
+                            except Exception as retry_exc:
+                                retry_error = str(retry_exc)
+                                add_log(f"第 {para_no} 段返修二次改写失败，保留第一轮结果：{retry_exc}", "warn")
+
+                        diff_html = make_diff_html_pair(original_text, new_text)
+                        status = "changed" if original_text != new_text else "unchanged"
+                        final_risk = analyze_ai_risk(new_text, task["section_type"])
+                        reject_reason = suspicious_rewrite_reason(original_text, new_text)
+                        if reject_reason:
+                            raise ValueError(f"改写结果触发安全阀：{reject_reason}，已拒绝写回。")
+                        rewrite_paragraph_text(task, new_text)
+                        st.session_state.rewrite_report.append(
+                            {
+                                "paragraph_index": para_no,
+                                "page": task["page"],
+                                "original_text": original_text,
+                                "new_text": new_text,
+                                "old_diff_html": diff_html["old_html"],
+                                "new_diff_html": diff_html["new_html"],
+                                "status": status,
+                                "error": retry_error if status == "unchanged" else "",
+                                "section": task["section_heading"],
+                                "section_type": task["section_type"],
+                                "write_mode": task.get("write_mode", ""),
+                                "rewrite_rounds": rewrite_rounds,
+                                "second_rewrite_applied": second_rewrite_applied,
+                                "reject_reason": reject_reason,
+                                "repair_mode": "aigc_report",
+                                "match_score": f"{match['score']:.3f}",
+                                "matched_fragments": " || ".join(match["fragments"][:5]),
+                                "risk_tags": ", ".join(task["risk_profile"]["tags"]),
+                                "final_risk_tags": ", ".join(final_risk["tags"]),
+                            }
+                        )
+                        add_log(f"第 {para_no} 段定点返修完成。", "success")
+                    except Exception as exc:
+                        st.session_state.rewrite_report.append(
+                            {
+                                "paragraph_index": para_no,
+                                "page": task["page"],
+                                "original_text": task["plain_text"],
+                                "new_text": task["plain_text"],
+                                "old_diff_html": "",
+                                "new_diff_html": "",
+                                "status": "failed",
+                                "error": str(exc),
+                                "section": task.get("section_heading", ""),
+                                "section_type": task.get("section_type", ""),
+                                "write_mode": task.get("write_mode", ""),
+                                "rewrite_rounds": rewrite_rounds,
+                                "second_rewrite_applied": second_rewrite_applied,
+                                "reject_reason": reject_reason,
+                                "repair_mode": "aigc_report",
+                                "match_score": f"{match['score']:.3f}",
+                                "matched_fragments": " || ".join(match["fragments"][:5]),
+                                "risk_tags": ", ".join(task.get("risk_profile", {}).get("tags", [])),
+                                "final_risk_tags": "",
+                            }
+                        )
+                        add_log(f"第 {para_no} 段定点返修失败，已保留原文：{exc}", "err")
+
+                    completed_tasks += 1
+                    update_progress(
+                        0.10 + (completed_tasks / len(matches)) * 0.80,
+                        f"检测报告返修中：已完成 {completed_tasks}/{len(matches)} 段。",
+                    )
+                    render_logs(log_container)
+
+            update_progress(0.92, "定点返修完成，正在打包 Word 文档...")
+            output_io = io.BytesIO()
+            with zipfile.ZipFile(output_io, "w", zipfile.ZIP_DEFLATED) as out_zip:
+                for item in doc_zip.infolist():
+                    if item.filename != "word/document.xml":
+                        out_zip.writestr(item, doc_zip.read(item.filename))
+                xml_str = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                out_zip.writestr("word/document.xml", xml_str)
+
+        clean_docx = output_io.getvalue()
+        add_log("检测报告返修版文档已打包完成。", "success")
+        update_progress(0.96, "返修版已生成，正在尝试生成修订痕迹版...")
+        try:
+            tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
+            st.session_state.tracked_file = tracked_docx
+            add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
+        except Exception as tracked_exc:
+            add_log(f"修订版生成失败，已保留返修版下载：{tracked_exc}", "warn")
+        render_logs(log_container)
+        update_progress(1.0, "检测报告返修完成，可以下载新文档。")
+        return clean_docx
+    except Exception as exc:
+        add_log(f"检测报告返修流程发生异常：{exc}", "err")
+        render_logs(log_container)
+        update_progress(0, "检测报告返修失败，请查看运行日志。")
+        return None
+
+
 st.title("AI Word 论文逐段润色工具")
 st.markdown("上传 .docx 后，系统会逐段发送正文给 AI，并只替换 Word XML 里的文本节点，尽量保持原有格式结构不变。")
 
@@ -1354,6 +1760,19 @@ with col_left:
 
     st.subheader("2. 上传文档")
     uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
+    process_mode = st.radio(
+        "处理模式",
+        ["整篇逐段润色", "检测报告定点返修"],
+        horizontal=True,
+        help="定点返修会读取 AIGC 检测报告，只改报告命中的疑似 AI 段落。",
+    )
+    aigc_report_file = None
+    if process_mode == "检测报告定点返修":
+        aigc_report_file = st.file_uploader(
+            "上传 AIGC 检测报告（HTML/PDF）",
+            type=["html", "htm", "pdf"],
+            help="优先上传检测平台导出的 HTML 统计报告；PDF 也可尝试解析。",
+        )
 
     headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
     heading_labels = [heading["label"] for heading in headings]
@@ -1410,9 +1829,12 @@ with col_right:
         unsafe_allow_html=True,
     )
 
-    if st.button("开始逐段润色", use_container_width=True, type="primary"):
+    button_label = "开始检测报告定点返修" if process_mode == "检测报告定点返修" else "开始逐段润色"
+    if st.button(button_label, use_container_width=True, type="primary"):
         if not uploaded_file:
             st.error("请先上传 Word 文档。")
+        elif process_mode == "检测报告定点返修" and not aigc_report_file:
+            st.error("请上传 AIGC 检测报告 HTML 或 PDF。")
         elif not api_key.startswith("sk-"):
             st.error("请填写有效的 DeepSeek API Key。")
         else:
@@ -1420,21 +1842,40 @@ with col_right:
             st.session_state.tracked_file = None
             progress_bar.progress(0)
             progress_status.caption("任务准备中...")
-            result_bytes = process_word(
-                uploaded_file.getvalue(),
-                api_key,
-                model_name,
-                concurrency,
-                start_paragraph_index,
-                end_paragraph_index,
-                min_chars,
-                prompt,
-                rewrite_temperature,
-                adaptive_risk_repair,
-                log_container,
-                progress_bar,
-                progress_status,
-            )
+            if process_mode == "检测报告定点返修":
+                st.session_state.output_prefix = "返修版"
+                result_bytes = process_report_repair_word(
+                    uploaded_file.getvalue(),
+                    aigc_report_file.getvalue(),
+                    aigc_report_file.name,
+                    api_key,
+                    model_name,
+                    concurrency,
+                    min_chars,
+                    prompt,
+                    rewrite_temperature,
+                    adaptive_risk_repair,
+                    log_container,
+                    progress_bar,
+                    progress_status,
+                )
+            else:
+                st.session_state.output_prefix = "润色版"
+                result_bytes = process_word(
+                    uploaded_file.getvalue(),
+                    api_key,
+                    model_name,
+                    concurrency,
+                    start_paragraph_index,
+                    end_paragraph_index,
+                    min_chars,
+                    prompt,
+                    rewrite_temperature,
+                    adaptive_risk_repair,
+                    log_container,
+                    progress_bar,
+                    progress_status,
+                )
 
             if result_bytes:
                 st.session_state.processed_file = result_bytes
@@ -1444,7 +1885,7 @@ with col_right:
         st.download_button(
             label="下载润色后的 Word 文档",
             data=st.session_state.processed_file,
-            file_name=f"润色版_{uploaded_file.name if uploaded_file else 'document.docx'}",
+            file_name=f"{st.session_state.output_prefix}_{uploaded_file.name if uploaded_file else 'document.docx'}",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
             type="primary",
@@ -1453,7 +1894,7 @@ with col_right:
         st.download_button(
             label="下载带修订痕迹的 Word 文档",
             data=st.session_state.tracked_file,
-            file_name=f"修订版_{uploaded_file.name if uploaded_file else 'document.docx'}",
+            file_name=f"修订版_{st.session_state.output_prefix}_{uploaded_file.name if uploaded_file else 'document.docx'}",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )

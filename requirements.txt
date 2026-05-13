@@ -1,3 +1,4 @@
 streamlit
 requests
 docx-editor
+pypdf
