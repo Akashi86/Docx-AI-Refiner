@@ -438,6 +438,35 @@ def generate_tracked_changes_docx(original_bytes, revised_bytes):
             pass
 
 
+def process_tracked_document(original_bytes, revised_bytes, log_container, progress_bar, progress_status=None):
+    st.session_state.logs = []
+    st.session_state.rewrite_report = []
+    st.session_state.tracked_file = None
+
+    def update_progress(value, message):
+        safe_value = min(max(float(value), 0.0), 1.0)
+        progress_bar.progress(safe_value)
+        if progress_status is not None:
+            progress_status.caption(message)
+
+    try:
+        update_progress(0.05, "正在读取两份 Word 文档...")
+        add_log("正在使用 docx_editor 生成修订文档。", "info")
+        render_logs(log_container)
+        update_progress(0.35, "正在对齐段落并写入修订痕迹...")
+        tracked_docx, tracked_count = generate_tracked_changes_docx(original_bytes, revised_bytes)
+        st.session_state.tracked_file = tracked_docx
+        add_log(f"修订文档已生成，共标记 {tracked_count} 个变更段落。", "success")
+        render_logs(log_container)
+        update_progress(1.0, "修订文档生成完成，可以下载。")
+        return tracked_docx
+    except Exception as exc:
+        add_log(f"修订文档生成失败：{exc}", "err")
+        render_logs(log_container)
+        update_progress(0, "修订文档生成失败，请查看运行日志。")
+        return None
+
+
 def make_system_prompt(user_prompt, extra_instruction=""):
     retry_instruction = f"\n\n{extra_instruction}" if extra_instruction else ""
     return f"""{user_prompt}{retry_instruction}
@@ -2031,13 +2060,18 @@ with col_left:
     st.subheader("1. 处理模式")
     process_mode = st.radio(
         "处理模式",
-        ["整篇逐段润色", "检测报告定点返修", "中文中转回译（百度翻译）"],
+        ["整篇逐段润色", "检测报告定点返修", "中文中转回译（百度翻译）", "生成修订文档"],
         horizontal=True,
-        help="定点返修只改 AIGC 检测报告命中的段落；回译模式使用百度翻译 API，无需 DeepSeek。",
+        help="定点返修只改 AIGC 检测报告命中的段落；回译模式使用百度翻译 API；修订文档模式使用 docx_editor 对比两份 Word。",
     )
 
-    st.subheader("2. API 配置")
-    if process_mode != "中文中转回译（百度翻译）":
+    needs_deepseek = process_mode in ("整篇逐段润色", "检测报告定点返修")
+    needs_baidu = process_mode == "中文中转回译（百度翻译）"
+    track_only_mode = process_mode == "生成修订文档"
+
+    if not track_only_mode:
+        st.subheader("2. API 配置")
+    if needs_deepseek:
         api_key = st.text_input("DeepSeek API Key", type="password")
         col_1, col_2 = st.columns(2)
         model_name = col_1.selectbox("模型", ["deepseek-chat", "deepseek-reasoner"])
@@ -2047,7 +2081,7 @@ with col_left:
         )
         baidu_appid = ""
         baidu_secret_key = ""
-    else:
+    elif needs_baidu:
         api_key = ""
         model_name = "deepseek-chat"
         col_b1, col_b2 = st.columns(2)
@@ -2061,14 +2095,29 @@ with col_left:
             "在 [百度翻译开放平台](https://fanyi-api.baidu.com/) 免费注册，"
             "免费版 QPS=1，必须单线程；高级版 QPS=10，可开 10 线程。"
         )
+    else:
+        api_key = ""
+        model_name = "deepseek-chat"
+        concurrency = 1
+        baidu_appid = ""
+        baidu_secret_key = ""
 
     st.subheader("3. 上传文档")
-    uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
-    generate_tracked_file = st.checkbox(
-        "生成修订痕迹版（较慢）",
-        value=False,
-        help="关闭后只生成润色/返修后的 Word，速度更快；需要对比修改痕迹时再开启。",
-    )
+    tracked_original_file = None
+    tracked_revised_file = None
+    if track_only_mode:
+        tracked_original_file = st.file_uploader("上传原文 Word (.docx)", type=["docx"], key="tracked_original")
+        tracked_revised_file = st.file_uploader("上传修改后 Word (.docx)", type=["docx"], key="tracked_revised")
+        uploaded_file = tracked_revised_file
+        generate_tracked_file = False
+        st.caption("该模式直接使用 docx_editor 生成段落级修订痕迹版，耗时取决于文档长度。")
+    else:
+        uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
+        generate_tracked_file = st.checkbox(
+            "生成修订痕迹版（较慢）",
+            value=False,
+            help="关闭后只生成润色/返修后的 Word，速度更快；需要对比修改痕迹时再开启。",
+        )
     aigc_report_file = None
     original_base_file = None
     if process_mode == "检测报告定点返修":
@@ -2084,12 +2133,13 @@ with col_left:
                 help='不上传则修订版默认比较当前待返修 Word -> 返修版。',
             )
 
-    headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
+    headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file and not track_only_mode else []
     heading_labels = [heading["label"] for heading in headings]
     heading_lookup = {heading["label"]: idx for idx, heading in enumerate(headings)}
 
-    st.subheader("4. 章节范围")
-    if headings:
+    if not track_only_mode:
+        st.subheader("4. 章节范围")
+    if headings and not track_only_mode:
         start_heading_label = st.selectbox("从哪个章节开始润色", ["全文开头"] + heading_labels)
         end_heading_label = st.selectbox("到哪个章节结束", ["全文末尾"] + heading_labels)
         start_heading_pos = heading_lookup.get(start_heading_label)
@@ -2098,14 +2148,20 @@ with col_left:
         end_paragraph_index = heading_section_end(headings, end_heading_pos) if end_heading_pos is not None else None
         if end_heading_pos is not None and headings[end_heading_pos]["paragraph_index"] <= start_paragraph_index:
             st.warning("结束章节位于开始章节之前，当前范围可能没有可处理正文。")
-    else:
+    elif not track_only_mode:
         start_paragraph_index = -1
         end_paragraph_index = None
         st.info("未识别到 Heading 1/2，将默认处理全文正文。")
+    else:
+        start_paragraph_index = -1
+        end_paragraph_index = None
 
-    min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=30, step=5)
+    if not track_only_mode:
+        min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=30, step=5)
+    else:
+        min_chars = 30
 
-    if process_mode != "中文中转回译（百度翻译）":
+    if needs_deepseek:
         st.subheader("5. 润色提示词")
         prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
         prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
@@ -2122,7 +2178,7 @@ with col_left:
             value=True,
             help="自动识别模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
         )
-    else:
+    elif needs_baidu:
         prompt = ""
         rewrite_temperature = 0.55
         adaptive_risk_repair = False
@@ -2183,12 +2239,21 @@ with col_left:
             "所有格式安全阀、长度保护、protected text 检测均正常生效。"
         )
 
-    enforce_format_safety = st.checkbox(
-        "启用格式安全阀",
-        value=True,
-        help="开启时，禁止输出新增 Markdown 星号或过于随意的口语化词组，并严格限制段落扩写长度（最大 1.45 倍）；"
-             "关闭后不仅允许星号和口语化，还会将字数扩写限制大幅放宽（最高允许 2.5 倍），以适应大量废话扩写。",
-    )
+    else:
+        prompt = ""
+        rewrite_temperature = 0.55
+        adaptive_risk_repair = False
+        lang_chain = []
+
+    if not track_only_mode:
+        enforce_format_safety = st.checkbox(
+            "启用格式安全阀",
+            value=True,
+            help="开启时，禁止输出新增 Markdown 星号或过于随意的口语化词组，并严格限制段落扩写长度（最大 1.45 倍）；"
+                 "关闭后不仅允许星号和口语化，还会将字数扩写限制大幅放宽（最高允许 2.5 倍），以适应大量废话扩写。",
+        )
+    else:
+        enforce_format_safety = True
 
 with col_right:
     st.subheader("运行日志")
@@ -2204,16 +2269,19 @@ with col_right:
     button_label_map = {
         "检测报告定点返修": "开始检测报告定点返修",
         "中文中转回译（百度翻译）": "开始中文中转回译",
+        "生成修订文档": "开始生成修订文档",
     }
     button_label = button_label_map.get(process_mode, "开始逐段润色")
     if st.button(button_label, use_container_width=True, type="primary"):
-        if not uploaded_file:
+        if track_only_mode and (not tracked_original_file or not tracked_revised_file):
+            st.error("请上传原文 Word 和修改后 Word。")
+        elif not uploaded_file:
             st.error("请先上传 Word 文档。")
         elif process_mode == "检测报告定点返修" and not aigc_report_file:
             st.error("请上传 AIGC 检测报告 HTML 或 PDF。")
         elif process_mode == "中文中转回译（百度翻译）" and (not baidu_appid or not baidu_secret_key):
             st.error("请填写百度翻译 APPID 和密钥。")
-        elif process_mode != "中文中转回译（百度翻译）" and not api_key.startswith("sk-"):
+        elif needs_deepseek and not api_key.startswith("sk-"):
             st.error("请填写有效的 DeepSeek API Key。")
         else:
             st.session_state.processed_file = None
@@ -2236,6 +2304,15 @@ with col_right:
                     adaptive_risk_repair,
                     enforce_format_safety,
                     generate_tracked_file,
+                    log_container,
+                    progress_bar,
+                    progress_status,
+                )
+            elif process_mode == "生成修订文档":
+                st.session_state.output_prefix = "修订版"
+                result_bytes = process_tracked_document(
+                    tracked_original_file.getvalue(),
+                    tracked_revised_file.getvalue(),
                     log_container,
                     progress_bar,
                     progress_status,
@@ -2280,7 +2357,7 @@ with col_right:
             if result_bytes:
                 st.session_state.processed_file = result_bytes
 
-    if st.session_state.processed_file:
+    if st.session_state.processed_file and process_mode != "生成修订文档":
         st.success("处理完成，可以下载新文档。")
         st.download_button(
             label="下载处理后的 Word 文档",
@@ -2294,9 +2371,10 @@ with col_right:
         st.download_button(
             label="下载带修订痕迹的 Word 文档",
             data=st.session_state.tracked_file,
-            file_name=f"修订版_{st.session_state.output_prefix}_{uploaded_file.name if uploaded_file else 'document.docx'}",
+            file_name=f"修订版_{tracked_revised_file.name if track_only_mode and tracked_revised_file else st.session_state.output_prefix + '_' + (uploaded_file.name if uploaded_file else 'document.docx')}",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
+            type="primary" if process_mode == "生成修订文档" else "secondary",
         )
 
 if st.session_state.rewrite_report:
