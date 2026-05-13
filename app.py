@@ -470,6 +470,14 @@ def paragraph_plain_text(paragraph):
     return "".join(elem.text or "" for elem in paragraph.iter(f"{W_NS}t")).strip()
 
 
+def word_count(text):
+    return len(re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*|[\u4e00-\u9fff]", text))
+
+
+def ends_with_sentence_punctuation(text):
+    return text.rstrip().endswith((".", "?", "!", "。", "？", "！", ";", "；", ":"))
+
+
 def paragraph_style_id(paragraph):
     p_pr = paragraph.find(f"{W_NS}pPr")
     if p_pr is None:
@@ -572,7 +580,10 @@ def is_body_paragraph(paragraph, style_names=None):
     compact_text = re.sub(r"\s+", " ", text).strip()
     if TITLE_LIKE_RE.match(compact_text) and len(compact_text) <= 80:
         return False
-    if len(compact_text.split()) <= 4 and not compact_text.endswith((".", "?", "!", "。", "？", "！")):
+    words = word_count(compact_text)
+    if words < 12:
+        return False
+    if words < 20 and not ends_with_sentence_punctuation(compact_text):
         return False
     return True
 
@@ -682,6 +693,14 @@ def rewrite_paragraph_text(task, new_text):
         paragraph.insert(first_index + offset, run)
 
 
+def is_suspicious_expansion(original_text, new_text):
+    original_words = word_count(original_text)
+    new_words = word_count(new_text)
+    if original_words < 20 and new_words > max(30, int(original_words * 2.5)):
+        return True
+    return False
+
+
 def process_word(
     file_bytes,
     api_key,
@@ -774,6 +793,8 @@ def process_word(
                                 )
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
+                        if is_suspicious_expansion(original_text, new_text):
+                            raise ValueError("疑似短标题或标签被扩写成正文，已拒绝写回。")
                         rewrite_paragraph_text(task, new_text)
                         st.session_state.rewrite_report.append(
                             {
