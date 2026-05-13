@@ -1500,6 +1500,7 @@ def process_report_repair_word(
     file_bytes,
     report_bytes,
     report_name,
+    tracked_base_bytes,
     api_key,
     model_name,
     concurrency,
@@ -1722,11 +1723,16 @@ def process_report_repair_word(
 
         clean_docx = output_io.getvalue()
         add_log("检测报告返修版文档已打包完成。", "success")
-        update_progress(0.96, "返修版已生成，正在尝试生成修订痕迹版...")
+        tracked_base = tracked_base_bytes or file_bytes
+        tracked_label = "原始第一版" if tracked_base_bytes else "当前上传文档"
+        update_progress(0.96, f"返修版已生成，正在尝试生成相对{tracked_label}的修订痕迹版...")
         try:
-            tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
+            tracked_docx, tracked_count = generate_tracked_changes_docx(tracked_base, clean_docx)
             st.session_state.tracked_file = tracked_docx
-            add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
+            add_log(
+                f"修订版文档已生成，比较基准：{tracked_label}，共写入 {tracked_count} 个段落级修订。",
+                "success",
+            )
         except Exception as tracked_exc:
             add_log(f"修订版生成失败，已保留返修版下载：{tracked_exc}", "warn")
         render_logs(log_container)
@@ -1767,11 +1773,17 @@ with col_left:
         help="定点返修会读取 AIGC 检测报告，只改报告命中的疑似 AI 段落。",
     )
     aigc_report_file = None
+    original_base_file = None
     if process_mode == "检测报告定点返修":
         aigc_report_file = st.file_uploader(
             "上传 AIGC 检测报告（HTML/PDF）",
             type=["html", "htm", "pdf"],
             help="优先上传检测平台导出的 HTML 统计报告；PDF 也可尝试解析。",
+        )
+        original_base_file = st.file_uploader(
+            "可选：上传第一版/原始 Word，用于生成相对原文的修订版",
+            type=["docx"],
+            help="不上传则修订版默认比较“当前待返修 Word -> 返修版”。上传后会比较“第一版/原文 -> 最终返修版”。",
         )
 
     headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
@@ -1848,6 +1860,7 @@ with col_right:
                     uploaded_file.getvalue(),
                     aigc_report_file.getvalue(),
                     aigc_report_file.name,
+                    original_base_file.getvalue() if original_base_file else None,
                     api_key,
                     model_name,
                     concurrency,
