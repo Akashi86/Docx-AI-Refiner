@@ -199,10 +199,6 @@ if "rewrite_report" not in st.session_state:
     st.session_state.rewrite_report = []
 if "output_prefix" not in st.session_state:
     st.session_state.output_prefix = "润色版"
-if "bt_result_file" not in st.session_state:
-    st.session_state.bt_result_file = None
-if "bt_report" not in st.session_state:
-    st.session_state.bt_report = []
 
 
 def add_log(message, kind="normal"):
@@ -734,108 +730,8 @@ def call_baidu_translate(text, from_lang, to_lang, appid, secret_key):
     data = resp.json()
     if "error_code" in data:
         raise RuntimeError(f"百度翻译错误 {data['error_code']}: {data.get('error_msg', '')}")
-    return "\n".join(item["dst"] for item in data["trans_result"])
+    return " ".join(item["dst"] for item in data["trans_result"])
 
-
-def back_translate_docx_baidu(
-    file_bytes, baidu_appid, baidu_secret_key,
-    min_chars, log_container, progress_bar, progress_status=None,
-):
-    bt_logs = []
-    bt_report = []
-
-    def _upd(value, msg):
-        progress_bar.progress(min(max(float(value), 0.0), 1.0))
-        if progress_status is not None:
-            progress_status.caption(msg)
-
-    def _log(msg, kind="normal"):
-        import html as _html, time as _time
-        safe = _html.escape(str(msg))
-        ts = _time.strftime("%H:%M:%S")
-        cls = {"success":"log-success","send":"log-send","warn":"log-warn",
-               "err":"log-err","info":"log-info"}.get(kind,"")
-        attr = f" {cls}" if cls else ""
-        bt_logs.append(f'<div class="log-entry{attr}">[{ts}] {safe}</div>')
-
-    def _render():
-        log_container.markdown(
-            f'<div class="log-box">{"".join(bt_logs)}</div>', unsafe_allow_html=True
-        )
-
-    try:
-        _upd(0.01, "正在读取并解析 Word 文档...")
-        _log("正在读取并解析 Word 文档。")
-        _render()
-        import io as _io, zipfile as _zip, xml.etree.ElementTree as _ET
-        input_buffer = _io.BytesIO(file_bytes)
-        with _zip.ZipFile(input_buffer, "r") as doc_zip:
-            xml_content = doc_zip.read("word/document.xml")
-            root = _ET.fromstring(xml_content)
-            style_names = read_style_names(doc_zip)
-            merge_adjacent_text_runs(root)
-            tasks = collect_tasks(root, style_names, -1, None, min_chars)
-            if not tasks:
-                _log("没有找到符合条件的正文段落。", "warn")
-                _render()
-                _upd(0, "没有找到可处理段落。")
-                return None, []
-
-            _log(f"共找到 {len(tasks)} 个段落，开始逐段回译（英→中→英）。", "info")
-            _upd(0.06, f"已找到 {len(tasks)} 个段落，开始回译...")
-            _render()
-
-            for idx, task in enumerate(tasks):
-                para_no = task["paragraph_index"] + 1
-                orig = task["plain_text"]
-                try:
-                    _log(f"第 {para_no} 段：英→中...", "send"); _render()
-                    zh = call_baidu_translate(orig, "en", "zh", baidu_appid, baidu_secret_key)
-                    time.sleep(1.1)
-                    _log(f"第 {para_no} 段：中→英...", "send"); _render()
-                    en = call_baidu_translate(zh, "zh", "en", baidu_appid, baidu_secret_key)
-                    time.sleep(1.1)
-                    new_text = en.strip()
-                    rej = suspicious_rewrite_reason(orig, new_text, enforce_format_safety=True)
-                    if rej:
-                        _log(f"第 {para_no} 段回译触发安全阀（{rej}），已保留原文。", "warn")
-                        bt_report.append({"paragraph_index": para_no, "page": task["page"],
-                                          "original_text": orig, "new_text": orig,
-                                          "status": "failed", "error": f"安全阀拒绝：{rej}"})
-                    else:
-                        rewrite_paragraph_text(task, new_text)
-                        status = "changed" if new_text != orig else "unchanged"
-                        _log(f"第 {para_no} 段回译完成。", "success")
-                        bt_report.append({"paragraph_index": para_no, "page": task["page"],
-                                          "original_text": orig, "new_text": new_text,
-                                          "status": status, "error": ""})
-                except Exception as exc:
-                    _log(f"第 {para_no} 段回译失败，已保留原文：{exc}", "err")
-                    bt_report.append({"paragraph_index": para_no, "page": task["page"],
-                                      "original_text": orig, "new_text": orig,
-                                      "status": "failed", "error": str(exc)})
-                _upd(0.06 + (idx + 1) / len(tasks) * 0.88, f"回译中：已完成 {idx + 1}/{len(tasks)} 段。")
-                _render()
-
-            _upd(0.96, "回译完成，正在打包 Word 文档...")
-            out_io = _io.BytesIO()
-            with _zip.ZipFile(out_io, "w", _zip.ZIP_DEFLATED) as out_zip:
-                for item in doc_zip.infolist():
-                    if item.filename != "word/document.xml":
-                        out_zip.writestr(item, doc_zip.read(item.filename))
-                xml_str = _ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                out_zip.writestr("word/document.xml", xml_str)
-
-        _log("回译版文档已打包完成。", "success")
-        _render()
-        _upd(1.0, "回译完成，可以下载。")
-        return out_io.getvalue(), bt_report
-
-    except Exception as exc:
-        _log(f"回译流程发生异常：{exc}", "err")
-        _render()
-        _upd(0, "回译失败，请查看日志。")
-        return None, []
 
 
 def direct_text_runs(paragraph):
@@ -1691,6 +1587,162 @@ def process_word(
         return None
 
 
+def process_word_baidu(
+    file_bytes,
+    baidu_appid,
+    baidu_secret_key,
+    start_paragraph_index,
+    end_paragraph_index,
+    min_chars,
+    enforce_format_safety,
+    generate_tracked_file,
+    log_container,
+    progress_bar,
+    progress_status=None,
+):
+    st.session_state.logs = []
+    st.session_state.rewrite_report = []
+    st.session_state.tracked_file = None
+
+    def update_progress(value, message):
+        safe_value = min(max(float(value), 0.0), 1.0)
+        progress_bar.progress(safe_value)
+        if progress_status is not None:
+            progress_status.caption(message)
+
+    try:
+        update_progress(0.01, "正在读取并解析 Word 文档...")
+        add_log("正在读取并解析 Word 文档。")
+        render_logs(log_container)
+
+        input_buffer = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(input_buffer, "r") as doc_zip:
+            xml_content = doc_zip.read("word/document.xml")
+            root = ET.fromstring(xml_content)
+            style_names = read_style_names(doc_zip)
+            merged_count = merge_adjacent_text_runs(root)
+
+            add_log(f"已合并 {merged_count} 个相邻同样式纯文本 run，正在扫描正文段落。")
+            tasks = collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index, min_chars)
+            if not tasks:
+                add_log("在设定范围内没有找到符合长度要求的正文段落。", "warn")
+                render_logs(log_container)
+                update_progress(0, "没有找到可处理段落。")
+                return None
+
+            add_log(f"共找到 {len(tasks)} 个待处理段落，开始逐段回译（英→中→英）。", "info")
+            add_log("注意：百度翻译免费版 QPS=1，每段约需 2~3 秒，请耐心等待。", "warn")
+            update_progress(0.06, f"已找到 {len(tasks)} 个待处理段落，开始回译...")
+            render_logs(log_container)
+
+            for idx, task in enumerate(tasks):
+                para_no = task["paragraph_index"] + 1
+                original_text = task["plain_text"]
+                reject_reason = ""
+                try:
+                    add_log(f"第 {para_no} 段，第 {task['page']} 页：英→中...", "send")
+                    render_logs(log_container)
+                    chinese_text = call_baidu_translate(
+                        original_text, "en", "zh", baidu_appid, baidu_secret_key
+                    )
+                    time.sleep(1.1)
+                    add_log(f"第 {para_no} 段：中→英...", "send")
+                    render_logs(log_container)
+                    english_text = call_baidu_translate(
+                        chinese_text, "zh", "en", baidu_appid, baidu_secret_key
+                    )
+                    time.sleep(1.1)
+                    new_text = english_text.strip()
+                    diff_html = make_diff_html_pair(original_text, new_text)
+                    status = "changed" if original_text != new_text else "unchanged"
+                    reject_reason = suspicious_rewrite_reason(
+                        original_text, new_text, enforce_format_safety=enforce_format_safety
+                    )
+                    if reject_reason:
+                        raise ValueError(f"改写结果触发安全阀：{reject_reason}，已拒绝写回。")
+                    rewrite_paragraph_text(task, new_text)
+                    final_risk = analyze_ai_risk(new_text, task["section_type"])
+                    st.session_state.rewrite_report.append({
+                        "paragraph_index": para_no,
+                        "page": task["page"],
+                        "original_text": original_text,
+                        "new_text": new_text,
+                        "old_diff_html": diff_html["old_html"],
+                        "new_diff_html": diff_html["new_html"],
+                        "status": status,
+                        "error": "",
+                        "section": task["section_heading"],
+                        "section_type": task["section_type"],
+                        "write_mode": task.get("write_mode", ""),
+                        "rewrite_rounds": 2,
+                        "second_rewrite_applied": False,
+                        "reject_reason": "",
+                        "risk_tags": ", ".join(task["risk_profile"]["tags"]),
+                        "final_risk_tags": ", ".join(final_risk["tags"]),
+                    })
+                    if status == "changed":
+                        add_log(f"第 {para_no} 段回译完成，已写回。", "success")
+                    else:
+                        add_log(f"第 {para_no} 段回译完成，但文本无明显变化。", "info")
+                except Exception as exc:
+                    st.session_state.rewrite_report.append({
+                        "paragraph_index": para_no,
+                        "page": task["page"],
+                        "original_text": original_text,
+                        "new_text": original_text,
+                        "old_diff_html": "",
+                        "new_diff_html": "",
+                        "status": "failed",
+                        "error": str(exc),
+                        "section": task.get("section_heading", ""),
+                        "section_type": task.get("section_type", ""),
+                        "write_mode": task.get("write_mode", ""),
+                        "rewrite_rounds": "",
+                        "second_rewrite_applied": False,
+                        "reject_reason": reject_reason,
+                        "risk_tags": ", ".join(task.get("risk_profile", {}).get("tags", [])),
+                        "final_risk_tags": "",
+                    })
+                    add_log(f"第 {para_no} 段回译失败，已保留原文：{exc}", "err")
+
+                update_progress(
+                    0.06 + (idx + 1) / len(tasks) * 0.84,
+                    f"回译中：已完成 {idx + 1}/{len(tasks)} 段。"
+                )
+                render_logs(log_container)
+
+            update_progress(0.92, "回译完成，正在打包 Word 文档...")
+            output_io = io.BytesIO()
+            with zipfile.ZipFile(output_io, "w", zipfile.ZIP_DEFLATED) as out_zip:
+                for item in doc_zip.infolist():
+                    if item.filename != "word/document.xml":
+                        out_zip.writestr(item, doc_zip.read(item.filename))
+                xml_str = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                out_zip.writestr("word/document.xml", xml_str)
+
+        clean_docx = output_io.getvalue()
+        add_log("回译版文档已打包完成。", "success")
+        if generate_tracked_file:
+            update_progress(0.96, "回译版已生成，正在生成修订痕迹版...")
+            try:
+                tracked_docx, tracked_count = generate_tracked_changes_docx(file_bytes, clean_docx)
+                st.session_state.tracked_file = tracked_docx
+                add_log(f"修订版文档已生成，共写入 {tracked_count} 个段落级修订。", "success")
+            except Exception as tracked_exc:
+                add_log(f"修订版生成失败，已保留回译版下载：{tracked_exc}", "warn")
+        else:
+            add_log("已跳过修订痕迹版生成，处理速度更快。", "info")
+        render_logs(log_container)
+        update_progress(1.0, "回译完成，可以下载新文档。")
+        return clean_docx
+
+    except Exception as exc:
+        add_log(f"回译流程发生异常：{exc}", "err")
+        render_logs(log_container)
+        update_progress(0, "回译失败，请查看运行日志。")
+        return None
+
+
 def process_report_repair_word(
     file_bytes,
     report_bytes,
@@ -1947,38 +1999,44 @@ def process_report_repair_word(
         render_logs(log_container)
         update_progress(0, "检测报告返修失败，请查看运行日志。")
         return None
-
-
 st.title("AI Word 论文逐段润色工具")
+st.markdown("上传 .docx 后，系统会逐段发送正文给 AI，并只替换 Word XML 里的文本节点，尽量保持原有格式结构不变。")
 
-tab_main, tab_backtranslate = st.tabs(["📝 AI 润色", "🔄 中文中转回译"])
-
-with tab_main:
-    st.markdown("上传 .docx 后，系统会逐段发送正文给 AI，并只替换 Word XML 里的文本节点，尽量保持原有格式结构不变。")
-    col_left, col_right = st.columns([1, 1.2])
+col_left, col_right = st.columns([1, 1.2])
 
 with col_left:
-    st.subheader("1. 模型与处理范围")
-    api_key = st.text_input("DeepSeek API Key", type="password")
-
-    col_1, col_2 = st.columns(2)
-    model_name = col_1.selectbox("模型", ["deepseek-chat", "deepseek-reasoner"])
-    concurrency = col_2.slider(
-        "并发请求数",
-        min_value=1,
-        max_value=8,
-        value=3,
-        help="建议 2-4。并发过高可能触发 API 限流。",
-    )
-
-    st.subheader("2. 上传文档")
-    uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
+    st.subheader("1. 处理模式")
     process_mode = st.radio(
         "处理模式",
-        ["整篇逐段润色", "检测报告定点返修"],
+        ["整篇逐段润色", "检测报告定点返修", "中文中转回译（百度翻译）"],
         horizontal=True,
-        help="定点返修会读取 AIGC 检测报告，只改报告命中的疑似 AI 段落。",
+        help="定点返修只改 AIGC 检测报告命中的段落；回译模式使用百度翻译 API，无需 DeepSeek。",
     )
+
+    st.subheader("2. API 配置")
+    if process_mode != "中文中转回译（百度翻译）":
+        api_key = st.text_input("DeepSeek API Key", type="password")
+        col_1, col_2 = st.columns(2)
+        model_name = col_1.selectbox("模型", ["deepseek-chat", "deepseek-reasoner"])
+        concurrency = col_2.slider(
+            "并发请求数", min_value=1, max_value=8, value=3,
+            help="建议 2-4。并发过高可能触发 API 限流。",
+        )
+        baidu_appid = ""
+        baidu_secret_key = ""
+    else:
+        api_key = ""
+        model_name = "deepseek-chat"
+        concurrency = 1
+        baidu_appid = st.text_input("百度翻译 APPID", key="baidu_appid")
+        baidu_secret_key = st.text_input("百度翻译密钥（Secret Key）", type="password", key="baidu_secret_key")
+        st.caption(
+            "在 [百度翻译开放平台](https://fanyi-api.baidu.com/) 免费注册，"
+            "每月5万字符免费额度，QPS=1，每段约需 2~3 秒。"
+        )
+
+    st.subheader("3. 上传文档")
+    uploaded_file = st.file_uploader("选择 Word 文档 (.docx)", type=["docx"])
     generate_tracked_file = st.checkbox(
         "生成修订痕迹版（较慢）",
         value=False,
@@ -1996,23 +2054,21 @@ with col_left:
             original_base_file = st.file_uploader(
                 "可选：上传第一版/原始 Word，用于生成相对原文的修订版",
                 type=["docx"],
-                help="不上传则修订版默认比较“当前待返修 Word -> 返修版”。上传后会比较“第一版/原文 -> 最终返修版”。",
+                help='不上传则修订版默认比较当前待返修 Word -> 返修版。',
             )
 
     headings = extract_headings_from_docx(uploaded_file.getvalue()) if uploaded_file else []
     heading_labels = [heading["label"] for heading in headings]
     heading_lookup = {heading["label"]: idx for idx, heading in enumerate(headings)}
 
-    st.subheader("3. 章节范围")
+    st.subheader("4. 章节范围")
     if headings:
         start_heading_label = st.selectbox("从哪个章节开始润色", ["全文开头"] + heading_labels)
         end_heading_label = st.selectbox("到哪个章节结束", ["全文末尾"] + heading_labels)
-
         start_heading_pos = heading_lookup.get(start_heading_label)
         end_heading_pos = heading_lookup.get(end_heading_label)
         start_paragraph_index = headings[start_heading_pos]["paragraph_index"] if start_heading_pos is not None else -1
         end_paragraph_index = heading_section_end(headings, end_heading_pos) if end_heading_pos is not None else None
-
         if end_heading_pos is not None and headings[end_heading_pos]["paragraph_index"] <= start_paragraph_index:
             st.warning("结束章节位于开始章节之前，当前范围可能没有可处理正文。")
     else:
@@ -2022,30 +2078,39 @@ with col_left:
 
     min_chars = st.slider("忽略短段落，少于 N 字符不处理", min_value=5, max_value=120, value=30, step=5)
 
-    st.subheader("4. 润色提示词")
-    prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
-    prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
-    rewrite_strength = st.selectbox(
-        "改写强度",
-        ["标准降 AI", "深度降 AI", "最大强改写"],
-        index=1,
-        help="强度越高，句式和措辞变化越大；如果检测结果仍偏高，优先尝试“最大强改写”。",
-    )
-    temperature_by_strength = {
-        "标准降 AI": 0.55,
-        "深度降 AI": 0.68,
-        "最大强改写": 0.78,
-    }
-    rewrite_temperature = temperature_by_strength[rewrite_strength]
-    adaptive_risk_repair = st.checkbox(
-        "启用段落风险扫描与自动二次修复",
-        value=True,
-        help="自动识别摘要、方法、结果、结论等段落中的模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
-    )
+    if process_mode != "中文中转回译（百度翻译）":
+        st.subheader("5. 润色提示词")
+        prompt_template_name = st.selectbox("提示词模板", list(PROMPT_TEMPLATES.keys()))
+        prompt = st.text_area("提示词", value=PROMPT_TEMPLATES[prompt_template_name], height=180)
+        rewrite_strength = st.selectbox(
+            "改写强度",
+            ["标准降 AI", "深度降 AI", "最大强改写"],
+            index=1,
+            help="强度越高，句式和措辞变化越大；如果检测结果仍偏高，优先尝试【最大强改写】。",
+        )
+        temperature_by_strength = {"标准降 AI": 0.55, "深度降 AI": 0.68, "最大强改写": 0.78}
+        rewrite_temperature = temperature_by_strength[rewrite_strength]
+        adaptive_risk_repair = st.checkbox(
+            "启用段落风险扫描与自动二次修复",
+            value=True,
+            help="自动识别模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
+        )
+    else:
+        prompt = ""
+        rewrite_temperature = 0.55
+        adaptive_risk_repair = False
+        st.subheader("5. 回译说明")
+        st.info(
+            "回译模式不需要提示词和改写强度。\n\n"
+            "流程：英文段落 → 百度翻译成中文 → 再翻译回英文。\n"
+            "所有已有安全阀（长度控制、格式保护、protected text 检测等）均正常生效。"
+        )
+
     enforce_format_safety = st.checkbox(
         "启用格式安全阀",
         value=True,
-        help="开启时，如果模型在原文没有星号的段落里新增 Markdown 星号，会拒绝写回；关闭后仍保留标题保护、过长扩写等内容安全阀。",
+        help="开启时，如果输出在原文没有星号的段落里新增 Markdown 星号，会拒绝写回；"
+             "关闭后仍保留标题保护、过长扩写等内容安全阀。",
     )
 
 with col_right:
@@ -2059,13 +2124,19 @@ with col_right:
         unsafe_allow_html=True,
     )
 
-    button_label = "开始检测报告定点返修" if process_mode == "检测报告定点返修" else "开始逐段润色"
+    button_label_map = {
+        "检测报告定点返修": "开始检测报告定点返修",
+        "中文中转回译（百度翻译）": "开始中文中转回译",
+    }
+    button_label = button_label_map.get(process_mode, "开始逐段润色")
     if st.button(button_label, use_container_width=True, type="primary"):
         if not uploaded_file:
             st.error("请先上传 Word 文档。")
         elif process_mode == "检测报告定点返修" and not aigc_report_file:
             st.error("请上传 AIGC 检测报告 HTML 或 PDF。")
-        elif not api_key.startswith("sk-"):
+        elif process_mode == "中文中转回译（百度翻译）" and (not baidu_appid or not baidu_secret_key):
+            st.error("请填写百度翻译 APPID 和密钥。")
+        elif process_mode != "中文中转回译（百度翻译）" and not api_key.startswith("sk-"):
             st.error("请填写有效的 DeepSeek API Key。")
         else:
             st.session_state.processed_file = None
@@ -2086,6 +2157,21 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
+                    enforce_format_safety,
+                    generate_tracked_file,
+                    log_container,
+                    progress_bar,
+                    progress_status,
+                )
+            elif process_mode == "中文中转回译（百度翻译）":
+                st.session_state.output_prefix = "回译版"
+                result_bytes = process_word_baidu(
+                    uploaded_file.getvalue(),
+                    baidu_appid,
+                    baidu_secret_key,
+                    start_paragraph_index,
+                    end_paragraph_index,
+                    min_chars,
                     enforce_format_safety,
                     generate_tracked_file,
                     log_container,
@@ -2118,7 +2204,7 @@ with col_right:
     if st.session_state.processed_file:
         st.success("处理完成，可以下载新文档。")
         st.download_button(
-            label="下载润色后的 Word 文档",
+            label="下载处理后的 Word 文档",
             data=st.session_state.processed_file,
             file_name=f"{st.session_state.output_prefix}_{uploaded_file.name if uploaded_file else 'document.docx'}",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2134,10 +2220,9 @@ with col_right:
             use_container_width=True,
         )
 
-with tab_main:
-    if st.session_state.rewrite_report:
-        st.divider()
-        st.subheader("改写对照清单")
+if st.session_state.rewrite_report:
+    st.divider()
+    st.subheader("改写对照清单")
 
     changed_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "changed")
     unchanged_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "unchanged")
@@ -2169,11 +2254,7 @@ with tab_main:
         key=lambda item: (item["page"], item["paragraph_index"]),
     )
     for item in sorted_report:
-        status_text_map = {
-            "changed": "已替换",
-            "unchanged": "无变化",
-            "failed": "保留原文",
-        }
+        status_text_map = {"changed": "已替换", "unchanged": "无变化", "failed": "保留原文"}
         status_text = status_text_map.get(item["status"], item["status"])
         with st.container(border=True):
             st.markdown(
@@ -2207,109 +2288,3 @@ with tab_main:
                     after_col.info("无明显文本差异。")
                 else:
                     after_col.warning(f"未写回：{item['error']}")
-
-with tab_backtranslate:
-    st.markdown("使用**百度翻译 API**（免费版每月5万字符）对 Word 正文段落做 **英→中→英** 回译，降低 AIGC 检测率，无需 DeepSeek API。")
-    bt_col_left, bt_col_right = st.columns([1, 1.2])
-
-    with bt_col_left:
-        st.subheader("1. 百度翻译 API 配置")
-        bt_appid = st.text_input("百度翻译 APPID", key="bt_appid")
-        bt_secret_key = st.text_input("百度翻译密钥（Secret Key）", type="password", key="bt_secret_key")
-        st.caption(
-            "在 [百度翻译开放平台](https://fanyi-api.baidu.com/) 免费注册获取，"
-            "每月5万字符免费额度，QPS=1。"
-        )
-        st.subheader("2. 上传文档")
-        bt_uploaded_file = st.file_uploader(
-            "选择 Word 文档 (.docx)", type=["docx"], key="bt_file"
-        )
-        bt_min_chars = st.slider(
-            "忽略短段落，少于 N 字符不处理",
-            min_value=5, max_value=120, value=30, step=5, key="bt_min_chars"
-        )
-        st.info(
-            "⚠️ 免费版 QPS=1，每段调用两次（英→中→英），"
-            "100段约需 3~4 分钟，请耐心等待。"
-        )
-
-    with bt_col_right:
-        st.subheader("运行日志")
-        bt_progress_bar = st.progress(0)
-        bt_progress_status = st.empty()
-        bt_progress_status.caption("等待任务开始。")
-        bt_log_container = st.empty()
-        bt_log_container.markdown(
-            '<div class="log-box"><div class="log-entry">等待任务开始。</div></div>',
-            unsafe_allow_html=True,
-        )
-
-        if st.button("开始中文中转回译", use_container_width=True, type="primary", key="bt_start"):
-            if not bt_uploaded_file:
-                st.error("请先上传 Word 文档。")
-            elif not bt_appid or not bt_secret_key:
-                st.error("请填写百度翻译 APPID 和密钥。")
-            else:
-                st.session_state.bt_result_file = None
-                st.session_state.bt_report = []
-                bt_progress_bar.progress(0)
-                bt_progress_status.caption("任务准备中...")
-                result_bytes, bt_rep = back_translate_docx_baidu(
-                    bt_uploaded_file.getvalue(),
-                    bt_appid,
-                    bt_secret_key,
-                    bt_min_chars,
-                    bt_log_container,
-                    bt_progress_bar,
-                    bt_progress_status,
-                )
-                if result_bytes:
-                    st.session_state.bt_result_file = result_bytes
-                    st.session_state.bt_report = bt_rep
-
-        if st.session_state.get("bt_result_file"):
-            st.success("回译完成，可以下载。")
-            bt_fname = bt_uploaded_file.name if bt_uploaded_file else "document.docx"
-            st.download_button(
-                label="下载回译后的 Word 文档",
-                data=st.session_state.bt_result_file,
-                file_name=f"回译版_{bt_fname}",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                type="primary",
-                key="bt_download",
-            )
-
-    if st.session_state.get("bt_report"):
-        st.divider()
-        st.subheader("回译对照清单")
-        bt_sorted = sorted(
-            st.session_state.bt_report,
-            key=lambda x: (x["page"], x["paragraph_index"]),
-        )
-        bt_changed = sum(1 for r in bt_sorted if r["status"] == "changed")
-        bt_failed = sum(1 for r in bt_sorted if r["status"] == "failed")
-        bc1, bc2, bc3 = st.columns(3)
-        bc1.metric("处理段落", len(bt_sorted))
-        bc2.metric("成功替换", bt_changed)
-        bc3.metric("失败/跳过", bt_failed)
-        for item in bt_sorted:
-            status_map = {"changed": "已替换", "unchanged": "无变化", "failed": "保留原文"}
-            with st.container(border=True):
-                st.markdown(
-                    f'<div class="compare-meta">第 {item["page"]} 页 / 第 {item["paragraph_index"]} 段 - {status_map.get(item["status"], item["status"])}</div>',
-                    unsafe_allow_html=True,
-                )
-                b_col, a_col = st.columns(2)
-                b_col.markdown("**原文**")
-                b_col.markdown(
-                    f'<div class="compare-text">{html.escape(item["original_text"])}</div>',
-                    unsafe_allow_html=True,
-                )
-                a_col.markdown("**回译后**")
-                a_col.markdown(
-                    f'<div class="compare-text">{html.escape(item["new_text"])}</div>',
-                    unsafe_allow_html=True,
-                )
-                if item["status"] == "failed" and item.get("error"):
-                    a_col.warning(f"未写回：{item['error']}")
