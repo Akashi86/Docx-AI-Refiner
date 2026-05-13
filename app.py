@@ -51,6 +51,28 @@ TITLE_LIKE_RE = re.compile(
 PROMPT_TEMPLATES = {
     "降 AI 率（英文）": """Without changing the paragraph structure or the order of information, rewrite the text below to reduce Al vibes. Do not start sentences with generic stock phrases ("in conclusion," "moreover," etc.); use more specific, context-tied transitions instead. Make each paragraph's first sentence feel like a natural continuation of the previous one. Favor concrete verbs over stacks of abstract nouns, keep terminology precise, and split long sentences into 2- 3 shorter ones.""",
     "降 AI 率（中文）": """请在不改变段落结构与信息顺序的前提下，重写下面文本以降低 AI 痕迹：同一句不要用常见的套话开头（如“综上所述”“此外”），改用更具体的衔接方式；让每段首句更像“承接上文”的自然过渡。多用具体动词，少用抽象名词堆叠。保持术语准确，但把长句拆成 2-3 个短句。""",
+    "学术润色（英文）": """Act as an experienced academic editor. Paraphrase the following text without changing the paragraph structure, information order, claims, evidence, terminology, citations, or scholarly rigor.
+
+Syntactic variation: Vary sentence openings and sentence length. Use active voice where it improves clarity, but keep passive voice when it is more appropriate for academic convention.
+
+Vocabulary shift: Avoid generic academic filler and statistically obvious phrasing. Prefer precise, domain-specific wording that reflects the topic rather than broad generalization.
+
+Logic and transitions: Make transitions specific to the argument instead of relying on formulaic connectors such as "moreover," "in addition," or "in conclusion." Preserve the original reasoning, but make the progression feel written by a careful human editor.
+
+Specificity: Keep concrete details, named concepts, examples, and technical distinctions. Do not invent facts, sources, data, or citations.
+
+Return only the revised paragraph.""",
+    "深度自然化（英文）": """Rewrite the paragraph below with a human-first academic style while preserving its meaning, paragraph structure, information order, terminology, citations, and factual boundaries.
+
+Texture: Add natural variation in rhythm, punctuation, and phrasing. Use dashes or semicolons only when they genuinely improve readability.
+
+Uneven but controlled rhythm: Avoid overly balanced, template-like academic prose. Let some sentences carry dense information while others clarify the point more directly.
+
+Word choice: Replace generic or predictable phrasing with more descriptive and context-sensitive wording, but do not make the prose ornate or imprecise.
+
+Scholarly restraint: Keep the tone appropriate for a thesis or research report. Do not add metaphors, rhetorical questions, claims, examples, or interpretations unless they are already supported by the source paragraph.
+
+Return only the revised paragraph.""",
 }
 
 
