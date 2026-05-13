@@ -293,7 +293,18 @@ def report_to_csv(report):
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=["paragraph_index", "page", "original_text", "new_text", "status", "error"],
+        fieldnames=[
+            "paragraph_index",
+            "page",
+            "section",
+            "section_type",
+            "risk_tags",
+            "final_risk_tags",
+            "original_text",
+            "new_text",
+            "status",
+            "error",
+        ],
     )
     writer.writeheader()
     for item in report:
@@ -301,6 +312,10 @@ def report_to_csv(report):
             {
                 "paragraph_index": item.get("paragraph_index", ""),
                 "page": item.get("page", ""),
+                "section": item.get("section", ""),
+                "section_type": item.get("section_type", ""),
+                "risk_tags": item.get("risk_tags", ""),
+                "final_risk_tags": item.get("final_risk_tags", ""),
                 "original_text": item.get("original_text", ""),
                 "new_text": item.get("new_text", ""),
                 "status": item.get("status", ""),
@@ -610,11 +625,18 @@ def is_body_paragraph(paragraph, style_names=None):
 def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index, min_chars):
     tasks = []
     current_page = 1
+    current_heading = ""
+    current_section_type = "general"
     end_index = end_paragraph_index if end_paragraph_index is not None else float("inf")
 
     paragraphs = list(root.iter(f"{W_NS}p"))
     for idx, paragraph in enumerate(paragraphs):
         current_page = paragraph_page_number(paragraph, current_page)
+        level = heading_level(paragraph, style_names)
+        if level in (1, 2):
+            current_heading = paragraph_plain_text(paragraph)
+            current_section_type = detect_section_type(current_heading)
+            continue
         if idx <= start_paragraph_index or idx >= end_index:
             continue
         if not is_body_paragraph(paragraph, style_names):
@@ -635,6 +657,9 @@ def collect_tasks(root, style_names, start_paragraph_index, end_paragraph_index,
                 "p_node": paragraph,
                 "text_runs": text_runs,
                 "plain_text": plain_text,
+                "section_heading": current_heading,
+                "section_type": current_section_type,
+                "risk_profile": analyze_ai_risk(plain_text, current_section_type),
                 "formatted_terms": formatted_terms_from_paragraph(paragraph),
             }
         )
@@ -720,6 +745,120 @@ def is_suspicious_expansion(original_text, new_text):
     return False
 
 
+AI_RISK_RULES = (
+    {
+        "tag": "generic_study_opening",
+        "pattern": r"\b(This study|The findings|The results|Existing research|Previous studies|It is important to note|To build upon)\b",
+        "instruction": "Replace generic study/report openings with a direct claim tied to this paragraph's local content.",
+    },
+    {
+        "tag": "template_connectors",
+        "pattern": r"\b(moreover|furthermore|in addition|in conclusion|overall|by contrast|on the other hand|from the perspective of|according to)\b",
+        "instruction": "Remove template connectors unless they are necessary; use a specific transition based on the surrounding argument.",
+    },
+    {
+        "tag": "stock_interpretive_verbs",
+        "pattern": r"\b(shows|reveals|demonstrates|highlights|indicates|suggests|reflects|underscores|illustrates)\b",
+        "instruction": "Avoid repeatedly using stock interpretive verbs such as shows/reveals/suggests; state the relation more concretely.",
+    },
+    {
+        "tag": "future_research_template",
+        "pattern": r"\b(future studies should|further research|future scholars|subsequent research|future work|longitudinal analysis would)\b",
+        "instruction": "Rewrite future-research language as specific unanswered questions or concrete next steps, not a formulaic closing paragraph.",
+    },
+    {
+        "tag": "over_casual_naturalization",
+        "pattern": r"\b(real headaches|make or break|isn't a coincidence|sticks closer|leans into|zeroes in|on the ground)\b",
+        "instruction": "Avoid casual AI-naturalized phrasing; keep the wording plain, academic, and author-like.",
+    },
+    {
+        "tag": "first_person_method",
+        "pattern": r"\b(I|we|my|our)\b.*\b(gathered|used|built|coded|classified|aligned|checked|analysis|method|corpus|data)\b",
+        "instruction": "Keep methodology procedural and thesis-appropriate; avoid unnecessary first-person narration.",
+    },
+)
+
+
+ABSTRACT_NOUN_RE = re.compile(
+    r"\b(tendency|strategy|framework|approach|distribution|analysis|difference|divergence|context|purpose|orientation|significance|methodology|classification|category|pattern|translation|foreignisation|foreignization|domestication)\b",
+    re.IGNORECASE,
+)
+DATA_RE = re.compile(r"\d+(?:\.\d+)?\s*%|\b\d+(?:\.\d+)?\b")
+
+
+def detect_section_type(heading_text):
+    heading = (heading_text or "").lower()
+    if "abstract" in heading:
+        return "abstract"
+    if "introduction" in heading:
+        return "introduction"
+    if "literature" in heading or "review" in heading:
+        return "literature_review"
+    if "method" in heading or "methodology" in heading:
+        return "methodology"
+    if "result" in heading or "discussion" in heading or "analysis" in heading:
+        return "results_discussion"
+    if "conclusion" in heading:
+        return "conclusion"
+    return "general"
+
+
+def analyze_ai_risk(text, section_type="general"):
+    tags = []
+    instructions = []
+    for rule in AI_RISK_RULES:
+        if re.search(rule["pattern"], text, re.IGNORECASE):
+            tags.append(rule["tag"])
+            instructions.append(rule["instruction"])
+
+    abstract_nouns = len(ABSTRACT_NOUN_RE.findall(text))
+    if abstract_nouns >= 6:
+        tags.append("abstract_noun_density")
+        instructions.append(
+            "Reduce abstract noun stacking; turn at least some strategy/framework/approach language into concrete actions, evidence, or relations."
+        )
+
+    has_data = bool(DATA_RE.search(text))
+    if has_data and re.search(
+        r"\b(show|shows|reveal|reveals|suggest|suggests|indicate|indicates|reflect|reflects|account|accounts|represent|represents)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        tags.append("formulaic_data_explanation")
+        instructions.append(
+            "For numbers or percentages, avoid the fixed pattern 'data + shows/suggests + broad meaning'; explain the specific comparison in plainer terms."
+        )
+
+    section_instructions = {
+        "abstract": "This appears to be abstract-like writing: keep it compact, factual, and less formulaic; avoid a chain of 'This study...' sentences.",
+        "introduction": "This appears to be introduction-like writing: reduce broad background claims and move quickly to the concrete research gap.",
+        "literature_review": "This appears to be literature-review writing: keep citations intact, but avoid the repeated 'existing studies have... however...' template.",
+        "methodology": "This appears to be methodology writing: preserve reproducible steps, but do not turn it into a polished narrative with unnecessary first person.",
+        "results_discussion": "This appears to be results/discussion writing: keep figures and comparisons accurate, but vary how the paragraph interprets data.",
+        "conclusion": "This appears to be conclusion-like writing: avoid generic contribution and future-study formulas; make the limitations and next steps specific.",
+    }
+    if section_type in section_instructions:
+        instructions.insert(0, section_instructions[section_type])
+        tags.append(f"section_{section_type}")
+
+    return {
+        "tags": sorted(set(tags)),
+        "score": len(set(tags)) + min(abstract_nouns // 6, 2),
+        "instructions": instructions,
+    }
+
+
+def build_risk_instruction(risk_profile):
+    instructions = risk_profile.get("instructions", [])
+    if not instructions:
+        return ""
+    bullets = "\n".join(f"- {item}" for item in instructions[:8])
+    return f"""Paragraph-specific risk repair:
+{bullets}
+
+Apply these repairs while preserving meaning, factual claims, citations, terminology, and the paragraph's role in the thesis."""
+
+
 def process_word(
     file_bytes,
     api_key,
@@ -730,6 +869,7 @@ def process_word(
     min_chars,
     prompt,
     rewrite_temperature,
+    adaptive_risk_repair,
     log_container,
     progress_bar,
 ):
@@ -762,6 +902,10 @@ def process_word(
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
                 future_to_task = {}
                 for task in tasks:
+                    risk_instruction = (
+                        build_risk_instruction(task["risk_profile"]) if adaptive_risk_repair else ""
+                    )
+                    task["risk_instruction"] = risk_instruction
                     future = executor.submit(
                         call_deepseek,
                         task["plain_text"],
@@ -770,6 +914,7 @@ def process_word(
                         model_name,
                         task["paragraph_index"] + 1,
                         rewrite_temperature,
+                        risk_instruction,
                     )
                     future_to_task[future] = task
                     add_log(
@@ -796,6 +941,8 @@ def process_word(
                                     para_no,
                                     temperature=min(rewrite_temperature + 0.1, 0.85),
                                     extra_instruction=(
+                                        task.get("risk_instruction", "")
+                                        + "\n\n"
                                         "Your previous revision was identical to the original. "
                                         "Revise again with more substantial wording and sentence-level changes, "
                                         "while preserving meaning, scholarly tone, and factual boundaries."
@@ -812,8 +959,42 @@ def process_word(
                                     f"第 {para_no} 段无变化重试失败，保留第一次合法结果：{retry_exc}",
                                     "warn",
                                 )
+                        elif adaptive_risk_repair:
+                            before_risk = task["risk_profile"]
+                            after_risk = analyze_ai_risk(new_text, task["section_type"])
+                            if before_risk["score"] >= 2 and after_risk["score"] >= before_risk["score"]:
+                                try:
+                                    retry_response_text = call_deepseek(
+                                        task["plain_text"],
+                                        prompt,
+                                        api_key,
+                                        model_name,
+                                        para_no,
+                                        temperature=min(rewrite_temperature + 0.12, 0.88),
+                                        extra_instruction=(
+                                            build_risk_instruction(after_risk)
+                                            + "\n\nYour previous rewrite still retained too many detector-prone patterns. "
+                                            "Rewrite again with less formulaic structure, fewer stock transitions, "
+                                            "and more paragraph-specific phrasing."
+                                        ),
+                                        max_retries=2,
+                                    )
+                                    retry_new_text = retry_response_text.strip()
+                                    if retry_new_text and retry_new_text != original_text:
+                                        new_text = retry_new_text
+                                        add_log(
+                                            f"Paragraph {para_no}: detector-prone patterns remained, so a second rewrite was applied.",
+                                            "info",
+                                        )
+                                except Exception as retry_exc:
+                                    retry_error = str(retry_exc)
+                                    add_log(
+                                        f"Paragraph {para_no}: second risk-repair rewrite failed; keeping the first result: {retry_exc}",
+                                        "warn",
+                                    )
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
+                        final_risk = analyze_ai_risk(new_text, task["section_type"])
                         if is_suspicious_expansion(original_text, new_text):
                             raise ValueError("疑似短标题或标签被扩写成正文，已拒绝写回。")
                         rewrite_paragraph_text(task, new_text)
@@ -827,6 +1008,10 @@ def process_word(
                                 "new_diff_html": diff_html["new_html"],
                                 "status": status,
                                 "error": retry_error if status == "unchanged" else "",
+                                "section": task["section_heading"],
+                                "section_type": task["section_type"],
+                                "risk_tags": ", ".join(task["risk_profile"]["tags"]),
+                                "final_risk_tags": ", ".join(final_risk["tags"]),
                             }
                         )
                         if status == "changed":
@@ -844,6 +1029,10 @@ def process_word(
                                 "new_diff_html": "",
                                 "status": "failed",
                                 "error": str(exc),
+                                "section": task.get("section_heading", ""),
+                                "section_type": task.get("section_type", ""),
+                                "risk_tags": ", ".join(task.get("risk_profile", {}).get("tags", [])),
+                                "final_risk_tags": "",
                             }
                         )
                         add_log(f"第 {para_no} 段处理失败，已保留原文：{exc}", "err")
@@ -938,6 +1127,11 @@ with col_left:
         "最大强改写": 0.78,
     }
     rewrite_temperature = temperature_by_strength[rewrite_strength]
+    adaptive_risk_repair = st.checkbox(
+        "启用段落风险扫描与自动二次修复",
+        value=True,
+        help="自动识别摘要、方法、结果、结论等段落中的模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
+    )
 
 with col_right:
     st.subheader("运行日志")
@@ -967,6 +1161,7 @@ with col_right:
                 min_chars,
                 prompt,
                 rewrite_temperature,
+                adaptive_risk_repair,
                 log_container,
                 progress_bar,
             )
