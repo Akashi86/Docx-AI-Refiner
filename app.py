@@ -69,13 +69,15 @@ CASUAL_REWRITE_RE = re.compile(
     re.IGNORECASE,
 )
 PROMPT_TEMPLATES = {
-    "降 AI 率（英文）": """Rewrite the paragraph in a restrained undergraduate thesis style. Preserve the exact meaning, evidence, names, citations, terminology, numbers, and order of information. Make wording and sentence structure less formulaic, but do not turn the paragraph into magazine-like, conversational, or over-polished prose.
+    "降 AI 率（英文）": """You are a professional AIGC-rate reduction tool. Rewrite the paragraph according to the following rules. The primary goal is to reduce AIGC-like writing while preserving academic professionalism.
 
-Important constraints:
-- Do not add examples, claims, conclusions, or explanatory details that are not already in the source.
-- Do not use contractions, rhetorical questions, punchy fragments, idioms, jokes, or casual phrases.
-- Avoid glossy AI-style balance, repeated "This study..." openings, stock transitions, and abstract noun stacks.
-- Keep the paragraph academically plain. Some sentences may stay simple and direct.
+Core requirements:
+- You may adjust sentence structure and use a slightly more natural, mildly conversational rhythm, but do not lose the professional thesis tone.
+- All proper nouns, technical terms, names, titles, citations, numbers, data, and terminology must be preserved completely and accurately.
+- If a sentence contains many proper nouns or technical terms and is difficult to restructure, simplify it and compress its length.
+- If a sentence contains few proper nouns or technical terms, expand it moderately and make the expression more detailed.
+- Keep the central meaning unchanged. Do not add unsupported facts, data, citations, or conclusions.
+- Use synonymous expressions, change sentence openings, and vary clause order where possible.
 - For titles, keyword lines, references, captions, and table/list labels, return the original unchanged.
 - Do not use Markdown formatting such as *italics* or **bold**.
 
