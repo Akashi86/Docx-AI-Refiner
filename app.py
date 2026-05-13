@@ -199,6 +199,10 @@ if "rewrite_report" not in st.session_state:
     st.session_state.rewrite_report = []
 if "output_prefix" not in st.session_state:
     st.session_state.output_prefix = "润色版"
+if "bt_result_file" not in st.session_state:
+    st.session_state.bt_result_file = None
+if "bt_report" not in st.session_state:
+    st.session_state.bt_report = []
 
 
 def add_log(message, kind="normal"):
@@ -714,6 +718,124 @@ def call_deepseek_direct(
             time.sleep(min(attempt * 4, 20))
 
     raise RuntimeError(f"段落 {task_id} 调用失败，已重试 {max_retries} 次：{last_error}")
+
+def call_baidu_translate(text, from_lang, to_lang, appid, secret_key):
+    import hashlib
+    salt = str(int(__import__('time').time() * 1000))
+    sign_str = appid + text + salt + secret_key
+    sign = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+    params = {"q": text, "from": from_lang, "to": to_lang,
+              "appid": appid, "salt": salt, "sign": sign}
+    resp = requests.get(
+        "https://fanyi-api.baidu.com/api/trans/vip/translate",
+        params=params, timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error_code" in data:
+        raise RuntimeError(f"百度翻译错误 {data['error_code']}: {data.get('error_msg', '')}")
+    return "\n".join(item["dst"] for item in data["trans_result"])
+
+
+def back_translate_docx_baidu(
+    file_bytes, baidu_appid, baidu_secret_key,
+    min_chars, log_container, progress_bar, progress_status=None,
+):
+    bt_logs = []
+    bt_report = []
+
+    def _upd(value, msg):
+        progress_bar.progress(min(max(float(value), 0.0), 1.0))
+        if progress_status is not None:
+            progress_status.caption(msg)
+
+    def _log(msg, kind="normal"):
+        import html as _html, time as _time
+        safe = _html.escape(str(msg))
+        ts = _time.strftime("%H:%M:%S")
+        cls = {"success":"log-success","send":"log-send","warn":"log-warn",
+               "err":"log-err","info":"log-info"}.get(kind,"")
+        attr = f" {cls}" if cls else ""
+        bt_logs.append(f'<div class="log-entry{attr}">[{ts}] {safe}</div>')
+
+    def _render():
+        log_container.markdown(
+            f'<div class="log-box">{"".join(bt_logs)}</div>', unsafe_allow_html=True
+        )
+
+    try:
+        _upd(0.01, "正在读取并解析 Word 文档...")
+        _log("正在读取并解析 Word 文档。")
+        _render()
+        import io as _io, zipfile as _zip, xml.etree.ElementTree as _ET
+        input_buffer = _io.BytesIO(file_bytes)
+        with _zip.ZipFile(input_buffer, "r") as doc_zip:
+            xml_content = doc_zip.read("word/document.xml")
+            root = _ET.fromstring(xml_content)
+            style_names = read_style_names(doc_zip)
+            merge_adjacent_text_runs(root)
+            tasks = collect_tasks(root, style_names, -1, None, min_chars)
+            if not tasks:
+                _log("没有找到符合条件的正文段落。", "warn")
+                _render()
+                _upd(0, "没有找到可处理段落。")
+                return None, []
+
+            _log(f"共找到 {len(tasks)} 个段落，开始逐段回译（英→中→英）。", "info")
+            _upd(0.06, f"已找到 {len(tasks)} 个段落，开始回译...")
+            _render()
+
+            for idx, task in enumerate(tasks):
+                para_no = task["paragraph_index"] + 1
+                orig = task["plain_text"]
+                try:
+                    _log(f"第 {para_no} 段：英→中...", "send"); _render()
+                    zh = call_baidu_translate(orig, "en", "zh", baidu_appid, baidu_secret_key)
+                    time.sleep(1.1)
+                    _log(f"第 {para_no} 段：中→英...", "send"); _render()
+                    en = call_baidu_translate(zh, "zh", "en", baidu_appid, baidu_secret_key)
+                    time.sleep(1.1)
+                    new_text = en.strip()
+                    rej = suspicious_rewrite_reason(orig, new_text, enforce_format_safety=True)
+                    if rej:
+                        _log(f"第 {para_no} 段回译触发安全阀（{rej}），已保留原文。", "warn")
+                        bt_report.append({"paragraph_index": para_no, "page": task["page"],
+                                          "original_text": orig, "new_text": orig,
+                                          "status": "failed", "error": f"安全阀拒绝：{rej}"})
+                    else:
+                        rewrite_paragraph_text(task, new_text)
+                        status = "changed" if new_text != orig else "unchanged"
+                        _log(f"第 {para_no} 段回译完成。", "success")
+                        bt_report.append({"paragraph_index": para_no, "page": task["page"],
+                                          "original_text": orig, "new_text": new_text,
+                                          "status": status, "error": ""})
+                except Exception as exc:
+                    _log(f"第 {para_no} 段回译失败，已保留原文：{exc}", "err")
+                    bt_report.append({"paragraph_index": para_no, "page": task["page"],
+                                      "original_text": orig, "new_text": orig,
+                                      "status": "failed", "error": str(exc)})
+                _upd(0.06 + (idx + 1) / len(tasks) * 0.88, f"回译中：已完成 {idx + 1}/{len(tasks)} 段。")
+                _render()
+
+            _upd(0.96, "回译完成，正在打包 Word 文档...")
+            out_io = _io.BytesIO()
+            with _zip.ZipFile(out_io, "w", _zip.ZIP_DEFLATED) as out_zip:
+                for item in doc_zip.infolist():
+                    if item.filename != "word/document.xml":
+                        out_zip.writestr(item, doc_zip.read(item.filename))
+                xml_str = _ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                out_zip.writestr("word/document.xml", xml_str)
+
+        _log("回译版文档已打包完成。", "success")
+        _render()
+        _upd(1.0, "回译完成，可以下载。")
+        return out_io.getvalue(), bt_report
+
+    except Exception as exc:
+        _log(f"回译流程发生异常：{exc}", "err")
+        _render()
+        _upd(0, "回译失败，请查看日志。")
+        return None, []
 
 
 def direct_text_runs(paragraph):
@@ -1284,46 +1406,6 @@ def build_force_rewrite_instruction(before_risk, after_risk, section_type):
     )
 
 
-def apply_back_translation_reduction(
-    text,
-    api_key,
-    model_name,
-    para_no,
-    base_temperature,
-):
-    chinese_prompt = """Translate the paragraph into Chinese as an intermediate draft.
-Strict rules:
-1. Return only the Chinese translation, with no notes or Markdown.
-2. Preserve all citations, numbers, names, book titles, theory names, corpus terms, and technical terms as accurately as possible.
-3. Do not add, delete, or reinterpret claims.
-4. Keep the paragraph as one paragraph."""
-    english_prompt = """Translate the Chinese intermediate draft back into English for an undergraduate thesis.
-Strict rules:
-1. Return only the final English paragraph, with no notes or Markdown.
-2. Preserve all citations, numbers, names, book titles, theory names, corpus terms, and technical terms exactly where possible.
-3. Do not add new facts, examples, references, data, or conclusions.
-4. Keep the tone plain, academic, and thesis-appropriate; avoid casual wording and template-like AI phrasing.
-5. Keep the paragraph as one paragraph."""
-    chinese_text = call_deepseek_direct(
-        text,
-        chinese_prompt,
-        api_key,
-        model_name,
-        f"{para_no}-zh",
-        temperature=min(base_temperature, 0.75),
-        max_retries=2,
-    )
-    english_text = call_deepseek_direct(
-        chinese_text,
-        english_prompt,
-        api_key,
-        model_name,
-        f"{para_no}-en",
-        temperature=min(base_temperature + 0.04, 0.82),
-        max_retries=2,
-    )
-    return english_text.strip()
-
 
 def process_word(
     file_bytes,
@@ -1336,7 +1418,6 @@ def process_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
-    enable_back_translation,
     enforce_format_safety,
     generate_tracked_file,
     log_container,
@@ -1511,24 +1592,6 @@ def process_word(
                                         f"Paragraph {para_no}: second risk-repair rewrite failed; keeping the first result: {retry_exc}",
                                         "warn",
                                     )
-                        if enable_back_translation:
-                            try:
-                                back_translated_text = apply_back_translation_reduction(
-                                    new_text,
-                                    api_key,
-                                    model_name,
-                                    para_no,
-                                    task.get("rewrite_temperature", rewrite_temperature),
-                                )
-                                if back_translated_text and back_translated_text != new_text:
-                                    new_text = back_translated_text
-                                    rewrite_rounds += 2
-                                    second_rewrite_applied = True
-                                    add_log(f"第 {para_no} 段已完成中文中转回译。", "info")
-                            except Exception as back_translate_exc:
-                                retry_error = str(back_translate_exc)
-                                add_log(f"第 {para_no} 段中文中转回译失败，保留上一轮结果：{back_translate_exc}", "warn")
-
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
@@ -1640,7 +1703,6 @@ def process_report_repair_word(
     prompt,
     rewrite_temperature,
     adaptive_risk_repair,
-    enable_back_translation,
     enforce_format_safety,
     generate_tracked_file,
     log_container,
@@ -1783,24 +1845,6 @@ def process_report_repair_word(
                                 retry_error = str(retry_exc)
                                 add_log(f"第 {para_no} 段返修二次改写失败，保留第一轮结果：{retry_exc}", "warn")
 
-                        if enable_back_translation:
-                            try:
-                                back_translated_text = apply_back_translation_reduction(
-                                    new_text,
-                                    api_key,
-                                    model_name,
-                                    para_no,
-                                    task.get("rewrite_temperature", rewrite_temperature),
-                                )
-                                if back_translated_text and back_translated_text != new_text:
-                                    new_text = back_translated_text
-                                    rewrite_rounds += 2
-                                    second_rewrite_applied = True
-                                    add_log(f"第 {para_no} 段已完成中文中转回译。", "info")
-                            except Exception as back_translate_exc:
-                                retry_error = str(back_translate_exc)
-                                add_log(f"第 {para_no} 段中文中转回译失败，保留上一轮结果：{back_translate_exc}", "warn")
-
                         diff_html = make_diff_html_pair(original_text, new_text)
                         status = "changed" if original_text != new_text else "unchanged"
                         final_risk = analyze_ai_risk(new_text, task["section_type"])
@@ -1906,9 +1950,12 @@ def process_report_repair_word(
 
 
 st.title("AI Word 论文逐段润色工具")
-st.markdown("上传 .docx 后，系统会逐段发送正文给 AI，并只替换 Word XML 里的文本节点，尽量保持原有格式结构不变。")
 
-col_left, col_right = st.columns([1, 1.2])
+tab_main, tab_backtranslate = st.tabs(["📝 AI 润色", "🔄 中文中转回译"])
+
+with tab_main:
+    st.markdown("上传 .docx 后，系统会逐段发送正文给 AI，并只替换 Word XML 里的文本节点，尽量保持原有格式结构不变。")
+    col_left, col_right = st.columns([1, 1.2])
 
 with col_left:
     st.subheader("1. 模型与处理范围")
@@ -1995,11 +2042,6 @@ with col_left:
         value=True,
         help="自动识别摘要、方法、结果、结论等段落中的模板句式、抽象名词堆叠和数据解释套话，并把这些问题传给模型定向改写。",
     )
-    enable_back_translation = st.checkbox(
-        "启用中文中转回译",
-        value=False,
-        help="每段先改写，再翻译成中文，最后翻译回英文。会明显增加耗时和 API 调用次数。",
-    )
     enforce_format_safety = st.checkbox(
         "启用格式安全阀",
         value=True,
@@ -2044,7 +2086,6 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
-                    enable_back_translation,
                     enforce_format_safety,
                     generate_tracked_file,
                     log_container,
@@ -2064,7 +2105,6 @@ with col_right:
                     prompt,
                     rewrite_temperature,
                     adaptive_risk_repair,
-                    enable_back_translation,
                     enforce_format_safety,
                     generate_tracked_file,
                     log_container,
@@ -2094,9 +2134,10 @@ with col_right:
             use_container_width=True,
         )
 
-if st.session_state.rewrite_report:
-    st.divider()
-    st.subheader("改写对照清单")
+with tab_main:
+    if st.session_state.rewrite_report:
+        st.divider()
+        st.subheader("改写对照清单")
 
     changed_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "changed")
     unchanged_count = sum(1 for item in st.session_state.rewrite_report if item["status"] == "unchanged")
@@ -2166,3 +2207,109 @@ if st.session_state.rewrite_report:
                     after_col.info("无明显文本差异。")
                 else:
                     after_col.warning(f"未写回：{item['error']}")
+
+with tab_backtranslate:
+    st.markdown("使用**百度翻译 API**（免费版每月5万字符）对 Word 正文段落做 **英→中→英** 回译，降低 AIGC 检测率，无需 DeepSeek API。")
+    bt_col_left, bt_col_right = st.columns([1, 1.2])
+
+    with bt_col_left:
+        st.subheader("1. 百度翻译 API 配置")
+        bt_appid = st.text_input("百度翻译 APPID", key="bt_appid")
+        bt_secret_key = st.text_input("百度翻译密钥（Secret Key）", type="password", key="bt_secret_key")
+        st.caption(
+            "在 [百度翻译开放平台](https://fanyi-api.baidu.com/) 免费注册获取，"
+            "每月5万字符免费额度，QPS=1。"
+        )
+        st.subheader("2. 上传文档")
+        bt_uploaded_file = st.file_uploader(
+            "选择 Word 文档 (.docx)", type=["docx"], key="bt_file"
+        )
+        bt_min_chars = st.slider(
+            "忽略短段落，少于 N 字符不处理",
+            min_value=5, max_value=120, value=30, step=5, key="bt_min_chars"
+        )
+        st.info(
+            "⚠️ 免费版 QPS=1，每段调用两次（英→中→英），"
+            "100段约需 3~4 分钟，请耐心等待。"
+        )
+
+    with bt_col_right:
+        st.subheader("运行日志")
+        bt_progress_bar = st.progress(0)
+        bt_progress_status = st.empty()
+        bt_progress_status.caption("等待任务开始。")
+        bt_log_container = st.empty()
+        bt_log_container.markdown(
+            '<div class="log-box"><div class="log-entry">等待任务开始。</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        if st.button("开始中文中转回译", use_container_width=True, type="primary", key="bt_start"):
+            if not bt_uploaded_file:
+                st.error("请先上传 Word 文档。")
+            elif not bt_appid or not bt_secret_key:
+                st.error("请填写百度翻译 APPID 和密钥。")
+            else:
+                st.session_state.bt_result_file = None
+                st.session_state.bt_report = []
+                bt_progress_bar.progress(0)
+                bt_progress_status.caption("任务准备中...")
+                result_bytes, bt_rep = back_translate_docx_baidu(
+                    bt_uploaded_file.getvalue(),
+                    bt_appid,
+                    bt_secret_key,
+                    bt_min_chars,
+                    bt_log_container,
+                    bt_progress_bar,
+                    bt_progress_status,
+                )
+                if result_bytes:
+                    st.session_state.bt_result_file = result_bytes
+                    st.session_state.bt_report = bt_rep
+
+        if st.session_state.get("bt_result_file"):
+            st.success("回译完成，可以下载。")
+            bt_fname = bt_uploaded_file.name if bt_uploaded_file else "document.docx"
+            st.download_button(
+                label="下载回译后的 Word 文档",
+                data=st.session_state.bt_result_file,
+                file_name=f"回译版_{bt_fname}",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                type="primary",
+                key="bt_download",
+            )
+
+    if st.session_state.get("bt_report"):
+        st.divider()
+        st.subheader("回译对照清单")
+        bt_sorted = sorted(
+            st.session_state.bt_report,
+            key=lambda x: (x["page"], x["paragraph_index"]),
+        )
+        bt_changed = sum(1 for r in bt_sorted if r["status"] == "changed")
+        bt_failed = sum(1 for r in bt_sorted if r["status"] == "failed")
+        bc1, bc2, bc3 = st.columns(3)
+        bc1.metric("处理段落", len(bt_sorted))
+        bc2.metric("成功替换", bt_changed)
+        bc3.metric("失败/跳过", bt_failed)
+        for item in bt_sorted:
+            status_map = {"changed": "已替换", "unchanged": "无变化", "failed": "保留原文"}
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="compare-meta">第 {item["page"]} 页 / 第 {item["paragraph_index"]} 段 - {status_map.get(item["status"], item["status"])}</div>',
+                    unsafe_allow_html=True,
+                )
+                b_col, a_col = st.columns(2)
+                b_col.markdown("**原文**")
+                b_col.markdown(
+                    f'<div class="compare-text">{html.escape(item["original_text"])}</div>',
+                    unsafe_allow_html=True,
+                )
+                a_col.markdown("**回译后**")
+                a_col.markdown(
+                    f'<div class="compare-text">{html.escape(item["new_text"])}</div>',
+                    unsafe_allow_html=True,
+                )
+                if item["status"] == "failed" and item.get("error"):
+                    a_col.warning(f"未写回：{item['error']}")
